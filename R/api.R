@@ -47,14 +47,34 @@ edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L) {
     warning("Model file should have .gguf extension for optimal compatibility")
   }
   
-  # Validate parameters
+  # Validate and optimize parameters
   if (!is.numeric(n_ctx) || n_ctx <= 0) {
     stop("n_ctx must be a positive integer")
   }
   if (!is.numeric(n_gpu_layers) || n_gpu_layers < 0) {
     stop("n_gpu_layers must be a non-negative integer")
   }
-  
+
+  # Adaptive context size optimization based on model size
+  model_size_mb <- file.info(model_path)$size / (1024^2)
+
+  # Auto-optimize context for small models (< 2GB)
+  if (model_size_mb < 2000 && n_ctx == 2048) {
+    # Small models work best with smaller contexts for faster inference
+    optimal_ctx <- if (model_size_mb < 1000) 1024 else 1536
+    n_ctx <- optimal_ctx
+    message("Optimized context size to ", n_ctx, " for small model (", round(model_size_mb, 1), "MB). ",
+            "Use n_ctx parameter to override.")
+  }
+
+  # Clamp to reasonable range
+  n_ctx <- max(512, min(n_ctx, 32768))
+
+  # Warn about large contexts
+  if (n_ctx > 8192) {
+    message("Large context size (", n_ctx, ") may impact performance. Consider using smaller values for faster inference.")
+  }
+
   # Try to load the model using the raw Rcpp function
   tryCatch({
     edge_load_model_internal(normalizePath(model_path), 
@@ -110,9 +130,14 @@ edge_completion <- function(ctx, prompt, n_predict = 128L, temperature = 0.8, to
   if (!is.character(prompt) || length(prompt) != 1L) {
     stop("Prompt must be a single character string")
   }
-  
-  edge_completion_internal(ctx, 
-                         prompt, 
+
+  # Optimize parameters for better performance and quality
+  n_predict <- max(1, min(n_predict, 4096))  # Clamp to reasonable range
+  temperature <- max(0.0, min(temperature, 2.0))  # Clamp temperature
+  top_p <- max(0.1, min(top_p, 1.0))  # Clamp top_p
+
+  edge_completion_internal(ctx,
+                         prompt,
                          as.integer(n_predict),
                          as.numeric(temperature),
                          as.numeric(top_p))
@@ -173,15 +198,15 @@ is_valid_model <- function(ctx) {
 #' @param cache_dir Directory to store downloaded models (default: user cache directory via tools::R_user_dir())
 #' @param force_download Force re-download even if file exists
 #' @return Path to the downloaded model file
-#' 
+#'
 #' @examples
 #' \donttest{
 #' # Download TinyLlama model
 #' model_path <- edge_download_model(
 #'   model_id = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-#'   filename = "tinyllama-1.1b-chat-v1.0.q4_k_m.gguf"
+#'   filename = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 #' )
-#' 
+#'
 #' # Use the downloaded model
 #' if (file.exists(model_path)) {
 #'   ctx <- edge_load_model(model_path)
@@ -204,12 +229,12 @@ edge_download_model <- function(model_id, filename, cache_dir = NULL, force_down
   if (nchar(filename) == 0) {
     stop("filename cannot be empty")
   }
-  
+
   # Set default cache directory using R_user_dir (CRAN compliant)
   if (is.null(cache_dir)) {
     cache_dir <- tools::R_user_dir("edgemodelr", "cache")
   }
-  
+
   # Create cache directory if it doesn't exist (with user consent)
   if (!dir.exists(cache_dir)) {
     # Ask for user consent in interactive sessions
@@ -221,144 +246,385 @@ edge_download_model <- function(model_id, filename, cache_dir = NULL, force_down
               "Create cache directory?"),
         default = TRUE
       )
-      
+
       if (is.na(consent) || !consent) {
         stop("User declined to create cache directory. ",
              "Download cancelled. You can specify a custom cache_dir parameter.")
       }
     }
-    
+
     dir.create(cache_dir, recursive = TRUE)
     if (verbose) message("Created cache directory: ", cache_dir)
   }
-  
+
   # Construct local file path
   local_path <- file.path(cache_dir, basename(filename))
-  
-  # Check if file already exists
+
+  # Check if file already exists and is valid
   if (file.exists(local_path) && !force_download) {
-    if (verbose) message("Model already exists: ", local_path)
-    return(local_path)
+    # Verify it's a valid GGUF file (starts with "GGUF" magic bytes)
+    if (.is_valid_gguf_file(local_path)) {
+      if (verbose) message("Model already exists: ", local_path)
+      return(local_path)
+    } else {
+      if (verbose) message("Existing file is incomplete or invalid, re-downloading...")
+      file.remove(local_path)
+    }
   }
-  
+
   # Construct Hugging Face URL
   base_url <- "https://huggingface.co"
   download_url <- file.path(base_url, model_id, "resolve", "main", filename)
-  
+
   if (verbose) {
     message("Downloading model...")
     message("From: ", download_url)
     message("To: ", local_path)
   }
-  
-  # Download the file
-  tryCatch({
-    # Try different download methods
-    download_success <- FALSE
-    methods_to_try <- c("auto", "curl", "wget", "wininet")
-    
-    for (method in methods_to_try) {
-      tryCatch({
-        utils::download.file(download_url, local_path, mode = "wb", method = method, quiet = FALSE)
-        if (file.exists(local_path) && file.info(local_path)$size > 1000) {  # At least 1KB
-          download_success <- TRUE
-          break
-        }
-      }, error = function(e) {
-        # Silently try next method
-      })
-    }
-    
-    if (download_success) {
+
+  # Download using robust method with retry support
+  download_success <- .robust_download(download_url, local_path, verbose = verbose)
+
+  if (download_success && file.exists(local_path)) {
+    # Verify the downloaded file is valid
+    if (.is_valid_gguf_file(local_path)) {
       if (verbose) {
+        file_size_mb <- round(file.info(local_path)$size / (1024^2), 1)
         message("Download completed successfully!")
-        message("Model size: ", round(file.info(local_path)$size / (1024^2), 1), "MB")
+        message("Model size: ", file_size_mb, "MB")
       }
       return(local_path)
     } else {
-      stop("All download methods failed")
+      # Downloaded file is not valid GGUF
+      file.remove(local_path)
+      stop("Downloaded file is not a valid GGUF model. ",
+           "This may indicate the model requires authentication.\n",
+           "For gated models (like Gemma), you need to:\n",
+           "1. Create a Hugging Face account at https://huggingface.co\n",
+           "2. Accept the model's license agreement\n",
+           "3. Create an access token at https://huggingface.co/settings/tokens\n",
+           "4. Set HF_TOKEN environment variable: Sys.setenv(HF_TOKEN='your_token')")
     }
-    
-  }, error = function(e) {
+  } else {
     # Clean up partial download
     if (file.exists(local_path)) {
       file.remove(local_path)
     }
-    
-    stop("Failed to download model: ", e$message, "\n",
+
+    stop("Failed to download model: All download methods failed\n",
          "Possible solutions:\n",
          "1. Check your internet connection\n",
-         "2. Try downloading manually:\n",
-         "   curl -L -o '", local_path, "' '", download_url, "'\n",
-         "3. Or use a different model from edge_list_models()")
+         "2. Try downloading manually with curl:\n",
+         "   curl -L -C - -o '", local_path, "' '", download_url, "'\n",
+         "3. For gated models, set HF_TOKEN environment variable\n",
+         "4. Or use Ollama: ollama pull <model_name>")
+  }
+}
+
+#' Check if a file is a valid GGUF file
+#' @param path Path to the file
+#' @return TRUE if valid GGUF, FALSE otherwise
+#' @keywords internal
+.is_valid_gguf_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+
+  file_size <- file.info(path)$size
+  # GGUF files should be at least 1MB for any real model
+  if (file_size < 1024 * 1024) return(FALSE)
+
+  # Check GGUF magic bytes: "GGUF" at start of file
+  tryCatch({
+    con <- file(path, "rb")
+    on.exit(close(con))
+    magic <- readBin(con, "raw", n = 4)
+    # GGUF magic: 0x47 0x47 0x55 0x46 ("GGUF")
+    return(identical(magic, as.raw(c(0x47, 0x47, 0x55, 0x46))))
+  }, error = function(e) {
+    return(FALSE)
   })
 }
 
+#' Robust file download with retry and resume support
+#' @param url URL to download
+#' @param destfile Destination file path
+#' @param verbose Print progress messages
+#' @param max_retries Maximum number of retry attempts
+#' @return TRUE if successful, FALSE otherwise
+#' @keywords internal
+.robust_download <- function(url, destfile, verbose = TRUE, max_retries = 3) {
+  # Get HF token if available
+  hf_token <- Sys.getenv("HF_TOKEN", unset = "")
+  if (nchar(hf_token) == 0) {
+    hf_token <- Sys.getenv("HUGGING_FACE_HUB_TOKEN", unset = "")
+  }
+
+  # Try curl first (most reliable for large files with redirects)
+  curl_path <- Sys.which("curl")
+  if (nchar(curl_path) > 0) {
+    if (verbose) message("Using curl for download...")
+    success <- .download_with_curl(url, destfile, hf_token, verbose, max_retries)
+    if (success) return(TRUE)
+  }
+
+  # Try wget as fallback
+
+  wget_path <- Sys.which("wget")
+  if (nchar(wget_path) > 0) {
+    if (verbose) message("Trying wget as fallback...")
+    success <- .download_with_wget(url, destfile, hf_token, verbose, max_retries)
+    if (success) return(TRUE)
+  }
+
+  # Try R's download.file with libcurl method as last resort
+  if (verbose) message("Trying R download.file with libcurl...")
+  success <- .download_with_r(url, destfile, hf_token, verbose, max_retries)
+  if (success) return(TRUE)
+
+  return(FALSE)
+}
+
+#' Download using curl command
+#' @keywords internal
+.download_with_curl <- function(url, destfile, hf_token = "", verbose = TRUE, max_retries = 3) {
+  for (attempt in 1:max_retries) {
+    if (attempt > 1 && verbose) {
+      message("Retry attempt ", attempt, " of ", max_retries, "...")
+    }
+
+    # Build curl command with proper options for large files
+    curl_args <- c(
+      "-L",                          # Follow redirects
+      "-C", "-",                     # Resume if partial file exists
+      "--connect-timeout", "30",     # Connection timeout
+      "--max-time", "7200",          # Max 2 hours for large files
+      "--retry", "3",                # Curl's own retry
+      "--retry-delay", "5",          # Delay between retries
+      "-#"                           # Progress bar
+    )
+
+    # Add authentication header if token available
+    if (nchar(hf_token) > 0) {
+      curl_args <- c(curl_args, "-H", paste0("Authorization: Bearer ", hf_token))
+    }
+
+    curl_args <- c(curl_args, "-o", destfile, url)
+
+    # Run curl
+    result <- tryCatch({
+      system2("curl", args = curl_args, stdout = if (verbose) "" else FALSE,
+              stderr = if (verbose) "" else FALSE)
+    }, error = function(e) {
+      return(1)
+    })
+
+    # Check if download succeeded and file is valid
+    if (result == 0 && file.exists(destfile) && .is_valid_gguf_file(destfile)) {
+      return(TRUE)
+    }
+
+    # Wait before retry
+    if (attempt < max_retries) {
+      Sys.sleep(2)
+    }
+  }
+
+  return(FALSE)
+}
+
+#' Download using wget command
+#' @keywords internal
+.download_with_wget <- function(url, destfile, hf_token = "", verbose = TRUE, max_retries = 3) {
+  for (attempt in 1:max_retries) {
+    if (attempt > 1 && verbose) {
+      message("Retry attempt ", attempt, " of ", max_retries, "...")
+    }
+
+    # Build wget command
+    wget_args <- c(
+      "-c",                          # Continue partial downloads
+      "--timeout=30",                # Timeout
+      "--tries=3",                   # Wget's own retry
+      "-O", destfile
+    )
+
+    # Add authentication if token available
+    if (nchar(hf_token) > 0) {
+      wget_args <- c(wget_args, paste0("--header=Authorization: Bearer ", hf_token))
+    }
+
+    wget_args <- c(wget_args, url)
+
+    # Run wget
+    result <- tryCatch({
+      system2("wget", args = wget_args, stdout = if (verbose) "" else FALSE,
+              stderr = if (verbose) "" else FALSE)
+    }, error = function(e) {
+      return(1)
+    })
+
+    if (result == 0 && file.exists(destfile) && .is_valid_gguf_file(destfile)) {
+      return(TRUE)
+    }
+
+    if (attempt < max_retries) {
+      Sys.sleep(2)
+    }
+  }
+
+  return(FALSE)
+}
+
+#' Download using R's download.file with libcurl
+#' @keywords internal
+.download_with_r <- function(url, destfile, hf_token = "", verbose = TRUE, max_retries = 3) {
+  for (attempt in 1:max_retries) {
+    if (attempt > 1 && verbose) {
+      message("Retry attempt ", attempt, " of ", max_retries, "...")
+    }
+
+    # Set headers if token available
+    if (nchar(hf_token) > 0) {
+      old_headers <- getOption("HTTPUserAgent")
+      options(HTTPUserAgent = paste0("Bearer ", hf_token))
+      on.exit(options(HTTPUserAgent = old_headers), add = TRUE)
+    }
+
+    # Try libcurl method which handles redirects better
+    result <- tryCatch({
+      # Increase timeout for large files
+      old_timeout <- getOption("timeout")
+      options(timeout = 7200)  # 2 hours
+      on.exit(options(timeout = old_timeout), add = TRUE)
+
+      utils::download.file(
+        url,
+        destfile,
+        mode = "wb",
+        method = "libcurl",
+        quiet = !verbose,
+        cacheOK = FALSE,
+        extra = if (nchar(hf_token) > 0) {
+          c("-H", paste0("Authorization: Bearer ", hf_token))
+        } else {
+          character(0)
+        }
+      )
+      0  # Success
+    }, error = function(e) {
+      if (verbose) message("Download error: ", e$message)
+      1  # Failure
+    }, warning = function(w) {
+      if (verbose) message("Download warning: ", w$message)
+      # Check if file was downloaded despite warning
+      if (file.exists(destfile) && file.info(destfile)$size > 1024 * 1024) {
+        return(0)
+      }
+      return(1)
+    })
+
+    if (result == 0 && file.exists(destfile) && .is_valid_gguf_file(destfile)) {
+      return(TRUE)
+    }
+
+    if (attempt < max_retries) {
+      Sys.sleep(2)
+    }
+  }
+
+  return(FALSE)
+}
+
 #' List popular pre-configured models
+#'
+#' Models are sourced from GPT4All CDN (direct download, no auth required) and Hugging Face.
+#' GPT4All models are recommended for offline use as they don't require any accounts.
 #'
 #' @return Data frame with model information
 #' @export
 edge_list_models <- function() {
   models <- data.frame(
     name = c(
-      "TinyLlama-1.1B", "TinyLlama-OpenOrca", 
-      "llama3.2-1b", "llama3.2-3b",
-      "phi3-mini", "qwen2.5-1.5b", "gemma2-2b"
+      # Small models (testing/mobile)
+      "TinyLlama-1.1B", "TinyLlama-OpenOrca",
+      # Medium models (2-5GB)
+      "llama3-8b", "mistral-7b", "llama3.2-3b", "phi3-mini",
+      # Large models (7-10GB) - Direct download from GPT4All CDN
+      "orca2-13b", "wizardlm-13b", "hermes-13b", "starcoder"
     ),
     size = c(
       "~700MB", "~700MB",
-      "~800MB", "~2GB", 
-      "~2.4GB", "~1GB", "~1.6GB"
+      "~4.7GB", "~4.1GB", "~2GB", "~2.4GB",
+      "~7.4GB", "~7.4GB", "~7.4GB", "~9GB"
     ),
-    model_id = c(
-      "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-      "TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF",
-      "bartowski/Llama-3.2-1B-Instruct-GGUF",
-      "bartowski/Llama-3.2-3B-Instruct-GGUF", 
-      "microsoft/Phi-3-mini-4k-instruct-gguf",
-      "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-      "google/gemma-2-2b-it-gguf"
+    download_url = c(
+      # HuggingFace models
+      "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+      "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_K_M.gguf",
+      # GPT4All CDN - direct download, no auth required
+      "https://gpt4all.io/models/gguf/Meta-Llama-3-8B-Instruct.Q4_0.gguf",
+      "https://gpt4all.io/models/gguf/mistral-7b-instruct-v0.1.Q4_0.gguf",
+      "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+      "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf",
+      # Large models - GPT4All CDN (no auth, direct download)
+      "https://gpt4all.io/models/gguf/orca-2-13b.Q4_0.gguf",
+      "https://gpt4all.io/models/gguf/wizardlm-13b-v1.2.Q4_0.gguf",
+      "https://gpt4all.io/models/gguf/nous-hermes-llama2-13b.Q4_0.gguf",
+      "https://gpt4all.io/models/gguf/starcoder-newbpe-q4_0.gguf"
     ),
     filename = c(
       "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
       "tinyllama-1.1b-1t-openorca.Q4_K_M.gguf",
-      "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+      "Meta-Llama-3-8B-Instruct.Q4_0.gguf",
+      "mistral-7b-instruct-v0.1.Q4_0.gguf",
       "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
       "Phi-3-mini-4k-instruct-q4.gguf",
-      "qwen2.5-1.5b-instruct-q4_k_m.gguf", 
-      "gemma-2-2b-it-q4_k_m.gguf"
+      "orca-2-13b.Q4_0.gguf",
+      "wizardlm-13b-v1.2.Q4_0.gguf",
+      "nous-hermes-llama2-13b.Q4_0.gguf",
+      "starcoder-newbpe-q4_0.gguf"
     ),
     use_case = c(
-      "Testing", "Better Chat", 
-      "2024 Mobile", "2024 General", 
-      "2024 Reasoning", "2024 Multilingual", "2024 Gemma"
+      "Testing", "Better Chat",
+      "General (8B)", "General (7B)", "Mobile (3B)", "Reasoning",
+      "13B Chat", "13B Instruct", "13B Chat", "Code (15B)"
+    ),
+    source = c(
+      "huggingface", "huggingface",
+      "gpt4all", "gpt4all", "huggingface", "huggingface",
+      "gpt4all", "gpt4all", "gpt4all", "gpt4all"
     ),
     stringsAsFactors = FALSE
   )
-  
+
   return(models)
 }
 
 #' Quick setup for a popular model
 #'
+#' Downloads a model from the built-in model list and loads it for inference.
+#' GPT4All models are downloaded directly without authentication.
+#'
 #' @param model_name Name of the model from edge_list_models()
 #' @param cache_dir Directory to store downloaded models (default: user cache directory via tools::R_user_dir())
 #' @param verbose Whether to print status messages (default: TRUE)
 #' @return List with model path and context (if llama.cpp is available)
-#' 
+#'
 #' @examples
 #' \donttest{
-#' # Quick setup with 2024 models
-#' setup <- edge_quick_setup("llama3.2-1b")  # Modern small model
+#' # Quick setup with a 7B model (no auth required)
+#' setup <- edge_quick_setup("mistral-7b")
 #' ctx <- setup$context
-#' 
+#'
+#' # Or use a larger 13B model
+#' setup <- edge_quick_setup("orca2-13b")  # 7.4GB, direct download
+#'
 #' if (!is.null(ctx)) {
 #'   response <- edge_completion(ctx, "Hello!")
 #'   cat("Response:", response, "\n")
 #'   edge_free_model(ctx)
 #' }
 #' }
-#' @export  
+#' @export
 edge_quick_setup <- function(model_name, cache_dir = NULL, verbose = TRUE) {
   # Parameter validation
   if (is.null(model_name)) {
@@ -370,25 +636,30 @@ edge_quick_setup <- function(model_name, cache_dir = NULL, verbose = TRUE) {
   if (nchar(model_name) == 0) {
     stop("model_name cannot be empty")
   }
-  
+
   models <- edge_list_models()
   model_info <- models[models$name == model_name, ]
-  
+
   if (nrow(model_info) == 0) {
-    stop("Model '", model_name, "' not found. Available models:\n", 
+    stop("Model '", model_name, "' not found. Available models:\n",
          paste(models$name, collapse = ", "))
   }
-  
-  if (verbose) message("Setting up ", model_name, "...")
-  
-  # Download model
-  model_path <- edge_download_model(
-    model_id = model_info$model_id,
+
+  if (verbose) {
+    message("Setting up ", model_name, " (", model_info$size, ")...")
+    if (model_info$source == "gpt4all") {
+      message("Source: GPT4All CDN (direct download, no auth required)")
+    }
+  }
+
+  # Download model using direct URL
+  model_path <- edge_download_url(
+    url = model_info$download_url,
     filename = model_info$filename,
     cache_dir = cache_dir,
     verbose = verbose
   )
-  
+
   # Try to load model (will show helpful error if llama.cpp not available)
   ctx <- tryCatch({
     edge_load_model(model_path)
@@ -398,12 +669,208 @@ edge_quick_setup <- function(model_name, cache_dir = NULL, verbose = TRUE) {
             "Install llama.cpp system-wide to use for inference.")
     NULL
   })
-  
+
   return(list(
     model_path = model_path,
     context = ctx,
     info = model_info
   ))
+}
+
+#' Download a model from a direct URL
+#'
+#' Downloads a GGUF model file from any URL. Supports resume and validates GGUF format.
+#'
+#' @param url Direct download URL for the model
+#' @param filename Local filename to save as
+#' @param cache_dir Directory to store downloaded models (default: user cache directory)
+#' @param force_download Force re-download even if file exists
+#' @param verbose Whether to print progress messages
+#' @return Path to the downloaded model file
+#'
+#' @examples
+#' \donttest{
+#' # Download from GPT4All CDN
+#' model_path <- edge_download_url(
+#'   url = "https://gpt4all.io/models/gguf/mistral-7b-instruct-v0.1.Q4_0.gguf",
+#'   filename = "mistral-7b.gguf"
+#' )
+#' }
+#' @export
+edge_download_url <- function(url, filename, cache_dir = NULL, force_download = FALSE, verbose = TRUE) {
+  # Validate inputs
+
+if (is.null(url) || !is.character(url) || nchar(url) == 0) {
+    stop("url must be a non-empty string")
+  }
+  if (is.null(filename) || !is.character(filename) || nchar(filename) == 0) {
+    stop("filename must be a non-empty string")
+  }
+
+  # Set default cache directory
+  if (is.null(cache_dir)) {
+    cache_dir <- tools::R_user_dir("edgemodelr", "cache")
+  }
+
+  # Create cache directory if needed
+  if (!dir.exists(cache_dir)) {
+    if (interactive()) {
+      consent <- utils::askYesNo(
+        paste("Create cache directory for models?\n", "Location:", cache_dir),
+        default = TRUE
+      )
+      if (is.na(consent) || !consent) {
+        stop("Cache directory required. Specify cache_dir parameter.")
+      }
+    }
+    dir.create(cache_dir, recursive = TRUE)
+    if (verbose) message("Created cache directory: ", cache_dir)
+  }
+
+  local_path <- file.path(cache_dir, basename(filename))
+
+  # Check if valid file exists
+  if (file.exists(local_path) && !force_download) {
+    if (.is_valid_gguf_file(local_path)) {
+      if (verbose) message("Model already exists: ", local_path)
+      return(local_path)
+    } else {
+      if (verbose) message("Existing file invalid, re-downloading...")
+      file.remove(local_path)
+    }
+  }
+
+  if (verbose) {
+    message("Downloading model...")
+    message("From: ", url)
+    message("To: ", local_path)
+  }
+
+  # Download using robust method
+  success <- .robust_download(url, local_path, verbose = verbose)
+
+  if (success && file.exists(local_path) && .is_valid_gguf_file(local_path)) {
+    if (verbose) {
+      file_size_gb <- round(file.info(local_path)$size / (1024^3), 2)
+      message("Download completed! Size: ", file_size_gb, " GB")
+    }
+    return(local_path)
+  } else {
+    if (file.exists(local_path)) file.remove(local_path)
+    stop("Download failed. Check your internet connection and try again.")
+  }
+}
+
+#' Get optimized configuration for small language models
+#'
+#' Returns recommended parameters for loading and using small models (1B-3B parameters)
+#' to maximize inference speed on resource-constrained devices.
+#'
+#' @param model_size_mb Model file size in MB (if known). If NULL, uses conservative defaults.
+#' @param available_ram_gb Available system RAM in GB. If NULL, uses conservative defaults.
+#' @param target Device target: "mobile", "laptop", "desktop", or "server" (default: "laptop")
+#' @return List with optimized parameters for edge_load_model() and edge_completion()
+#'
+#' @examples
+#' # Get optimized config for a 700MB model on a laptop
+#' config <- edge_small_model_config(model_size_mb = 700, available_ram_gb = 8)
+#'
+#' # Use the config to load a model
+#' \donttest{
+#' model_path <- "path/to/tinyllama.gguf"
+#' if (file.exists(model_path)) {
+#'   ctx <- edge_load_model(
+#'     model_path,
+#'     n_ctx = config$n_ctx,
+#'     n_gpu_layers = config$n_gpu_layers
+#'   )
+#'
+#'   result <- edge_completion(
+#'     ctx,
+#'     prompt = "Hello",
+#'     n_predict = config$recommended_n_predict,
+#'     temperature = config$recommended_temperature
+#'   )
+#'
+#'   edge_free_model(ctx)
+#' }
+#' }
+#' @export
+edge_small_model_config <- function(model_size_mb = NULL, available_ram_gb = NULL, target = "laptop") {
+  # Default configurations based on target device
+  configs <- list(
+    mobile = list(
+      n_ctx = 512,
+      n_gpu_layers = 0,
+      recommended_n_predict = 50,
+      recommended_temperature = 0.7,
+      description = "Optimized for mobile devices with limited RAM"
+    ),
+    laptop = list(
+      n_ctx = 1024,
+      n_gpu_layers = 0,
+      recommended_n_predict = 100,
+      recommended_temperature = 0.8,
+      description = "Balanced performance for laptops"
+    ),
+    desktop = list(
+      n_ctx = 2048,
+      n_gpu_layers = 0,
+      recommended_n_predict = 150,
+      recommended_temperature = 0.8,
+      description = "Higher quality for desktop systems"
+    ),
+    server = list(
+      n_ctx = 4096,
+      n_gpu_layers = 0,
+      recommended_n_predict = 200,
+      recommended_temperature = 0.8,
+      description = "Maximum quality for server deployments"
+    )
+  )
+
+  # Get base config
+  if (!target %in% names(configs)) {
+    warning("Unknown target '", target, "'. Using 'laptop' defaults.")
+    target <- "laptop"
+  }
+
+  config <- configs[[target]]
+
+  # Adjust based on model size if provided
+  if (!is.null(model_size_mb)) {
+    if (model_size_mb < 1000) {
+      # Very small models (< 1GB): can use larger context
+      config$n_ctx <- min(config$n_ctx * 1.5, 2048)
+      config$recommended_n_predict <- min(config$recommended_n_predict * 1.2, 200)
+    } else if (model_size_mb > 2000) {
+      # Larger models (> 2GB): reduce context to save memory
+      config$n_ctx <- max(config$n_ctx * 0.75, 512)
+      config$recommended_n_predict <- max(config$recommended_n_predict * 0.8, 50)
+    }
+  }
+
+  # Adjust based on available RAM if provided
+  if (!is.null(available_ram_gb)) {
+    if (available_ram_gb < 4) {
+      config$n_ctx <- min(config$n_ctx, 512)
+      config$recommended_n_predict <- min(config$recommended_n_predict, 50)
+    } else if (available_ram_gb > 16) {
+      config$n_ctx <- min(config$n_ctx * 1.5, 4096)
+      config$recommended_n_predict <- min(config$recommended_n_predict * 1.5, 300)
+    }
+  }
+
+  # Add performance tips
+  config$tips <- c(
+    paste0("Recommended context size: ", config$n_ctx, " tokens"),
+    paste0("Recommended generation length: ", config$recommended_n_predict, " tokens"),
+    "For faster inference, use temperature=0.0 (greedy decoding)",
+    "For better quality, increase temperature to 0.8-1.0",
+    "Small models work best with concise, clear prompts"
+  )
+
+  return(config)
 }
 
 #' Stream text completion with real-time token generation
@@ -590,6 +1057,7 @@ build_chat_prompt <- function(history) {
 #' @param max_age_days Maximum age of files to keep in days (default: 30)
 #' @param max_size_mb Maximum total cache size in MB (default: 500)
 #' @param interactive Whether to ask for user confirmation before deletion
+#' @param verbose Whether to print status messages (default: TRUE)
 #' @return Invisible list of deleted files
 #' @examples
 #' \donttest{
@@ -700,3 +1168,373 @@ edge_set_verbose <- function(enabled = FALSE) {
   set_llama_logging(enabled)
   invisible(NULL)
 }
+
+#' Performance benchmarking for model inference
+#'
+#' Test inference speed and throughput with the current model to measure
+#' the effectiveness of optimizations.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param prompt Test prompt to use for benchmarking (default: standard test)
+#' @param n_predict Number of tokens to generate for the test
+#' @param iterations Number of test iterations to average results
+#' @return List with performance metrics
+#'
+#' @examples
+#' \donttest{
+#' setup <- edge_quick_setup("TinyLlama-1.1B")
+#' if (!is.null(setup$context)) {
+#'   ctx <- setup$context
+#'   perf <- edge_benchmark(ctx)
+#'   print(perf)
+#'   edge_free_model(ctx)
+#' }
+#' }
+#' @export
+edge_benchmark <- function(ctx, prompt = "The quick brown fox", n_predict = 50, iterations = 3) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context")
+  }
+
+  times <- numeric(iterations)
+  tokens_per_sec <- numeric(iterations)
+
+  message("Running performance benchmark with ", iterations, " iterations...")
+
+  for (i in 1:iterations) {
+    start_time <- Sys.time()
+    result <- edge_completion(ctx, prompt, n_predict = n_predict, temperature = 0.0)
+    end_time <- Sys.time()
+
+    elapsed <- as.numeric(end_time - start_time, units = "secs")
+    times[i] <- elapsed
+    tokens_per_sec[i] <- n_predict / elapsed
+
+    message("Iteration ", i, ": ", round(elapsed, 3), "s (", round(tokens_per_sec[i], 1), " tokens/sec)")
+  }
+
+  list(
+    avg_time_per_token = mean(times) / n_predict,
+    avg_tokens_per_second = mean(tokens_per_sec),
+    min_tokens_per_second = min(tokens_per_sec),
+    max_tokens_per_second = max(tokens_per_sec),
+    total_time = sum(times),
+    iterations = iterations,
+    tokens_per_iteration = n_predict
+  )
+}
+
+#' Find and prepare GGUF models for use with edgemodelr
+#'
+#' This function finds compatible GGUF model files from various sources including
+#' Ollama installations, custom directories, or any folder containing GGUF files.
+#' It tests each model for compatibility with edgemodelr and creates organized
+#' copies or links for easy access.
+#'
+#' @param source_dirs Vector of directories to search for GGUF files. If NULL,
+#'   automatically searches common locations including Ollama installation.
+#' @param target_dir Directory where to create links/copies of compatible models.
+#'   If NULL, creates a "local_models" directory in the current working directory.
+#' @param create_links Logical. If TRUE (default), creates symbolic links to save disk space.
+#'   If FALSE, copies the files (uses more disk space but more compatible).
+#' @param model_pattern Optional pattern to filter model files by name.
+#' @param test_compatibility Logical. If TRUE (default), tests each GGUF file for
+#'   compatibility with edgemodelr before including it.
+#' @param min_size_mb Minimum file size in MB to consider (default: 50MB).
+#'   Helps filter out config files and focus on actual models.
+#' @param verbose Logical. Whether to print detailed progress information.
+#' @return List containing information about compatible models, including paths and metadata
+#'
+#' @details
+#' This function performs the following steps:
+#' \enumerate{
+#'   \item Searches specified directories (or auto-detects common locations)
+#'   \item Identifies GGUF format files above the minimum size threshold
+#'   \item Optionally tests each file for compatibility with edgemodelr
+#'   \item Creates organized symbolic links or copies in the target directory
+#'   \item Returns detailed information about working models
+#' }
+#'
+#' The function automatically searches these locations if no source_dirs specified:
+#' \itemize{
+#'   \item Ollama models directory (~/.ollama/models or %USERPROFILE%/.ollama/models)
+#'   \item Current working directory
+#'   \item ~/models directory (if exists)
+#'   \item Common model storage locations
+#' }
+#'
+#' @examples
+#' \donttest{
+#' # Basic usage - auto-detect and test all GGUF models
+#' models_info <- edge_find_gguf_models()
+#' if (!is.null(models_info) && length(models_info$models) > 0) {
+#'   # Load the first compatible model
+#'   ctx <- edge_load_model(models_info$models[[1]]$path)
+#'   result <- edge_completion(ctx, "Hello", n_predict = 20)
+#'   edge_free_model(ctx)
+#' }
+#'
+#' # Search specific directories
+#' models_info <- edge_find_gguf_models(source_dirs = c("~/Downloads", "~/models"))
+#'
+#' # Skip compatibility testing (faster but less reliable)
+#' models_info <- edge_find_gguf_models(test_compatibility = FALSE)
+#'
+#' # Copy files instead of creating links
+#' models_info <- edge_find_gguf_models(create_links = FALSE)
+#'
+#' # Filter for specific models
+#' models_info <- edge_find_gguf_models(model_pattern = "llama")
+#' }
+#' @export
+edge_find_gguf_models <- function(source_dirs = NULL, target_dir = NULL, create_links = TRUE,
+                                  model_pattern = NULL, test_compatibility = TRUE,
+                                  min_size_mb = 50, verbose = TRUE) {
+
+  # Set default target directory
+  if (is.null(target_dir)) {
+    target_dir <- file.path(getwd(), "local_models")
+  }
+  target_dir <- path.expand(target_dir)
+
+  if (verbose) {
+    message("[*] Searching for GGUF model files...")
+  }
+
+  # Determine source directories to search
+  if (is.null(source_dirs)) {
+    source_dirs <- c()
+
+    # Add Ollama directory if it exists
+    ollama_paths <- c(
+      path.expand("~/.ollama/models/blobs"),
+      file.path(Sys.getenv("USERPROFILE"), ".ollama", "models", "blobs"),
+      "/usr/share/ollama/models/blobs"
+    )
+    for (path in ollama_paths) {
+      if (dir.exists(path)) {
+        source_dirs <- c(source_dirs, path)
+        if (verbose) message("[*] Found Ollama models: ", path)
+        break
+      }
+    }
+
+    # Add common model directories
+    common_dirs <- c(
+      getwd(),
+      path.expand("~/models"),
+      path.expand("~/Downloads"),
+      file.path(getwd(), "models"),
+      file.path(getwd(), "local_models")
+    )
+
+    for (dir in common_dirs) {
+      if (dir.exists(dir)) {
+        source_dirs <- c(source_dirs, dir)
+      }
+    }
+
+    if (length(source_dirs) == 0) {
+      if (verbose) message("[!] No source directories found")
+      return(NULL)
+    }
+  } else {
+    # Expand user-provided directories
+    source_dirs <- path.expand(source_dirs)
+    source_dirs <- source_dirs[dir.exists(source_dirs)]
+
+    if (length(source_dirs) == 0) {
+      if (verbose) message("[!] None of the specified directories exist")
+      return(NULL)
+    }
+  }
+
+  if (verbose) {
+    message("[*] Searching ", length(source_dirs), " directories for GGUF files")
+  }
+
+  # Find all potential GGUF files
+  all_files <- c()
+  for (dir in source_dirs) {
+    # Look for .gguf files
+    gguf_files <- list.files(dir, pattern = "\\.gguf$", full.names = TRUE, recursive = TRUE)
+
+    # Also check files without extension (like Ollama blobs)
+    all_dir_files <- list.files(dir, full.names = TRUE, recursive = FALSE)
+
+    for (file in all_dir_files) {
+      if (file.exists(file) && !dir.exists(file) && file.size(file) > min_size_mb * 1024 * 1024) {
+        # Check if it's a GGUF file by reading header
+        tryCatch({
+          con <- file(file, "rb")
+          header <- readBin(con, "raw", 4)
+          close(con)
+
+          if (length(header) == 4 && identical(header, charToRaw("GGUF"))) {
+            gguf_files <- c(gguf_files, file)
+          }
+        }, error = function(e) {
+          # Skip files that can't be read
+        })
+      }
+    }
+
+    all_files <- c(all_files, gguf_files)
+  }
+
+  # Remove duplicates and filter by size
+  all_files <- unique(all_files)
+  all_files <- all_files[file.size(all_files) >= min_size_mb * 1024 * 1024]
+
+  if (length(all_files) == 0) {
+    if (verbose) {
+      message("[!] No GGUF files found above ", min_size_mb, "MB")
+      message("[*] Try: edge_quick_setup('TinyLlama-1.1B') to download a compatible model")
+    }
+    return(NULL)
+  }
+
+  # Apply pattern filter if specified
+  if (!is.null(model_pattern)) {
+    pattern_matches <- grepl(model_pattern, basename(all_files), ignore.case = TRUE)
+    all_files <- all_files[pattern_matches]
+
+    if (length(all_files) == 0) {
+      if (verbose) message("[!] No files match pattern: ", model_pattern)
+      return(NULL)
+    }
+  }
+
+  if (verbose) {
+    message("[*] Found ", length(all_files), " GGUF files to process")
+  }
+
+  # Create target directory
+  if (!dir.exists(target_dir)) {
+    dir.create(target_dir, recursive = TRUE)
+    if (verbose) message("[*] Created target directory: ", target_dir)
+  }
+
+  # Process each file
+  compatible_models <- list()
+
+  for (i in seq_along(all_files)) {
+    file_path <- all_files[i]
+    file_name <- basename(file_path)
+    size_mb <- round(file.size(file_path) / (1024^2), 1)
+
+    if (verbose) {
+      message("[*] Processing ", i, "/", length(all_files), ": ", file_name, " (", size_mb, "MB)")
+    }
+
+    # Generate a clean model name
+    if (grepl("\\.gguf$", file_name)) {
+      model_name <- gsub("\\.gguf$", "", file_name)
+    } else {
+      # For Ollama blobs, create descriptive name
+      model_name <- paste0("model_", size_mb, "mb_", substr(file_name, 8, 15))
+    }
+
+    model_name <- gsub("[^a-zA-Z0-9._-]", "_", model_name)  # Clean name
+
+    # Test compatibility if requested
+    is_compatible <- TRUE
+    test_result <- ""
+
+    if (test_compatibility) {
+      if (verbose) message("  [*] Testing compatibility...")
+
+      tryCatch({
+        # Try to load the model
+        temp_ctx <- edge_load_model(file_path, n_ctx = 256, n_gpu_layers = 0)
+
+        if (is_valid_model(temp_ctx)) {
+          # Quick test
+          test_result <- edge_completion(temp_ctx, "Hi", n_predict = 3, temperature = 0.1)
+          edge_free_model(temp_ctx)
+
+          if (verbose) message("  [+] Compatible! Test: '", test_result, "'")
+        } else {
+          is_compatible <- FALSE
+          if (verbose) message("  [!] Model validation failed")
+        }
+      }, error = function(e) {
+        is_compatible <- FALSE
+        if (verbose) message("  [!] Compatibility test failed: ", e$message)
+      })
+    } else {
+      if (verbose) message("  [*] Skipping compatibility test")
+    }
+
+    if (is_compatible) {
+      # Create target file
+      target_file <- file.path(target_dir, paste0(model_name, ".gguf"))
+
+      # Ensure unique filename
+      counter <- 1
+      original_target <- target_file
+      while (file.exists(target_file)) {
+        target_file <- file.path(target_dir, paste0(model_name, "_", counter, ".gguf"))
+        counter <- counter + 1
+      }
+
+      # Copy or link the file
+      success <- FALSE
+      if (create_links && .Platform$OS.type != "windows") {
+        tryCatch({
+          file.symlink(file_path, target_file)
+          success <- TRUE
+          if (verbose) message("  [*] Created symbolic link")
+        }, error = function(e) {
+          if (verbose) message("  [!] Symlink failed, copying...")
+        })
+      }
+
+      if (!success) {
+        success <- file.copy(file_path, target_file, overwrite = TRUE)
+        if (success && verbose) message("  [*] Copied file")
+      }
+
+      if (success) {
+        compatible_models[[model_name]] <- list(
+          name = model_name,
+          path = target_file,
+          source = file_path,
+          size_mb = size_mb,
+          compatible = is_compatible,
+          test_result = test_result,
+          linked = create_links && .Platform$OS.type != "windows"
+        )
+      }
+    }
+  }
+
+  if (length(compatible_models) == 0) {
+    if (verbose) {
+      message("[!] No compatible models found")
+      if (test_compatibility) {
+        message("[*] Try with test_compatibility = FALSE to include untested models")
+      }
+      message("[*] Or use: edge_quick_setup('TinyLlama-1.1B') for a guaranteed working model")
+    }
+    return(NULL)
+  }
+
+  if (verbose) {
+    message("[+] Found ", length(compatible_models), " compatible models!")
+    message("[*] Usage example:")
+    message("   ctx <- edge_load_model('", compatible_models[[1]]$path, "')")
+    message("   result <- edge_completion(ctx, 'Your prompt here', n_predict = 50)")
+    message("   edge_free_model(ctx)")
+  }
+
+  return(list(
+    target_dir = target_dir,
+    models = compatible_models,
+    total_models = length(compatible_models),
+    method = ifelse(test_compatibility, "tested_compatibility", "format_only"),
+    search_dirs = source_dirs,
+    disk_space_saved = ifelse(create_links, sum(sapply(compatible_models, function(x) x$size_mb)), 0)
+  ))
+}
+

@@ -21,7 +21,7 @@ edge_clean_cache(
 
 \item{interactive}{Whether to ask for user confirmation before deletion}
 
-\item{verbose}{Whether to print detailed messages about cleaning progress}
+\item{verbose}{Whether to print status messages (default: TRUE)}
 }
 \value{
 Invisible list of deleted files

@@ -6,6 +6,7 @@
 #include <vector>
 #include <thread>
 #include <cstdio>
+#include <fstream>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -38,46 +39,127 @@ void quiet_log_callback(ggml_log_level level, const char * text, void * user_dat
   // Otherwise, completely suppress output
 }
 
+// Helper function to ensure initialization is done
+static void ensure_llama_initialized() {
+  static bool initialized = false;
+  if (!initialized) {
+    // Set up quiet logging
+    llama_log_set(quiet_log_callback, NULL);
+
+    // Load all available backends (including CPU)
+    ggml_backend_load_all();
+
+    // Initialize llama backend
+    llama_backend_init();
+
+    // Register CPU backend explicitly
+    ggml_backend_register(ggml_backend_cpu_reg());
+
+    initialized = true;
+  }
+}
+
 struct EdgeModelContext {
   struct llama_model* model = NULL;
   struct llama_context* ctx = NULL;
-  
+
   EdgeModelContext() = default;
-  
+
+  // Copy constructor and assignment deleted to prevent double-free
+  EdgeModelContext(const EdgeModelContext&) = delete;
+  EdgeModelContext& operator=(const EdgeModelContext&) = delete;
+
   ~EdgeModelContext() {
-    if (ctx) llama_free(ctx);
-    if (model) llama_model_free(model);
+    cleanup();
   }
-  
+
+  void cleanup() {
+    if (ctx) {
+      llama_free(ctx);
+      ctx = NULL;
+    }
+    if (model) {
+      llama_model_free(model);
+      model = NULL;
+    }
+  }
+
   bool is_valid() const {
     return model != NULL && ctx != NULL;
+  }
+
+  // Additional safety check for pointers
+  bool is_safe() const {
+    try {
+      return is_valid() &&
+             llama_n_ctx(ctx) > 0 &&
+             llama_model_n_ctx_train(model) > 0;
+    } catch (...) {
+      return false;
+    }
   }
 };
 
 // [[Rcpp::export]]
 SEXP edge_load_model_internal(std::string model_path, int n_ctx = 2048, int n_gpu_layers = 0) {
   try {
-    // Set up quiet logging before any llama operations
-    llama_log_set(quiet_log_callback, NULL);
-    
-    // Load all available backends (including CPU)
-    ggml_backend_load_all();
-    
-    // Initialize llama backend
-    llama_backend_init();
+    // Ensure llama is properly initialized
+    ensure_llama_initialized();
     
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     
     struct llama_model* model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model) {
-      stop("Failed to load GGUF model from: " + model_path);
+      // Check if file exists
+      std::ifstream file(model_path);
+      if (!file.good()) {
+        stop("Model file does not exist or is not readable: " + model_path);
+      }
+
+      // Enhanced diagnostics for GGUF files
+      std::string diagnostic_msg = "Failed to load GGUF model from: " + model_path +
+                                   ". The file exists but llama.cpp cannot parse it.\n";
+
+      // Check if it looks like a GGUF file
+      file.seekg(0);
+      char magic[4];
+      if (file.read(magic, 4) && std::string(magic, 4) == "GGUF") {
+        diagnostic_msg += "File has valid GGUF magic header. Possible issues:\n";
+        diagnostic_msg += "- Incompatible GGUF version (try a different llama.cpp version)\n";
+        diagnostic_msg += "- Model architecture not supported\n";
+        diagnostic_msg += "- File corruption during download\n";
+        diagnostic_msg += "- Insufficient memory (try smaller n_ctx or n_gpu_layers=0)\n";
+      } else {
+        diagnostic_msg += "File does not have GGUF magic header. This is not a valid GGUF file.\n";
+        diagnostic_msg += "For Ollama models, ensure you're using the correct blob file path.\n";
+      }
+
+      stop(diagnostic_msg);
     }
     
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = 512;
-    ctx_params.n_threads = std::max(1, (int)std::thread::hardware_concurrency() / 2);
+
+    // Adaptive batch size optimization for small models
+    // Small models benefit from larger batches relative to context size
+    int optimal_batch;
+    if (n_ctx <= 512) {
+      optimal_batch = std::min(512, n_ctx);  // Very small context: use up to full context
+    } else if (n_ctx <= 2048) {
+      optimal_batch = std::min(512, n_ctx / 2);  // Small models: use 1/2 context
+    } else if (n_ctx <= 4096) {
+      optimal_batch = std::min(1024, n_ctx / 4);  // Medium models: use 1/4 context
+    } else {
+      optimal_batch = std::min(2048, n_ctx / 4);  // Large context: cap at 2048
+    }
+    ctx_params.n_batch = optimal_batch;
+
+    // Adaptive thread count for small models (they don't benefit from many threads)
+    int hardware_threads = std::max(1, (int)std::thread::hardware_concurrency());
+    // For small contexts (typical of small models), limit threads to avoid overhead
+    int optimal_threads = (n_ctx <= 2048) ? std::min(4, hardware_threads) : hardware_threads;
+    ctx_params.n_threads = optimal_threads;
     
     struct llama_context* ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -104,13 +186,24 @@ std::string edge_completion_internal(SEXP model_ptr, std::string prompt, int n_p
     if (TYPEOF(model_ptr) != EXTPTRSXP) {
       stop("Invalid model context");
     }
-    
+
     XPtr<EdgeModelContext> edge_ctx(model_ptr);
-    
-    if (!edge_ctx->is_valid()) {
-      stop("Invalid model context");
+
+    if (!edge_ctx->is_valid() || edge_ctx->ctx == nullptr || edge_ctx->model == nullptr) {
+      stop("Invalid model context or null pointers");
     }
-    
+
+    // Validate input parameters
+    if (n_predict <= 0) {
+      stop("n_predict must be positive");
+    }
+    if (temperature < 0.0 || temperature > 2.0) {
+      stop("Temperature must be between 0.0 and 2.0");
+    }
+    if (top_p <= 0.0 || top_p > 1.0) {
+      stop("top_p must be between 0.0 and 1.0");
+    }
+
     // Get vocabulary from model
     const struct llama_vocab* vocab = llama_model_get_vocab(edge_ctx->model);
     if (!vocab) {
@@ -139,50 +232,64 @@ std::string edge_completion_internal(SEXP model_ptr, std::string prompt, int n_p
     }
     
     std::string result = prompt;  // Start with the original prompt
-    result.reserve(prompt.size() + n_predict * 4);
+    result.reserve(prompt.size() + n_predict * 8);  // Reserve more space to avoid reallocations
     
-    // Generate tokens one by one using simple greedy sampling
+    // Create a sampler chain for better token generation
+    auto sampler_chain_params = llama_sampler_chain_default_params();
+    auto * sampler = llama_sampler_chain_init(sampler_chain_params);
+
+    // Add samplers in the right order for quality generation
+    if (top_p < 1.0f) {
+      llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+    }
+    if (temperature > 0.0f) {
+      llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    }
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(12345)); // Random seed
+
+    // Generate tokens using the new sampler API
     for (int i = 0; i < n_predict; ++i) {
-      // Get logits from the context
-      const float* logits = llama_get_logits_ith(edge_ctx->ctx, -1);
-      if (!logits) {
-        break;
-      }
-      
-      // Get vocabulary size using the correct API
-      const int n_vocab = llama_vocab_n_tokens(vocab);
-      llama_token new_token = 0;
-      float max_logit = logits[0];
-      
-      for (int j = 1; j < n_vocab; ++j) {
-        if (logits[j] > max_logit) {
-          max_logit = logits[j];
-          new_token = j;
-        }
-      }
+      // Sample next token using the sampler chain
+      llama_token new_token = llama_sampler_sample(sampler, edge_ctx->ctx, -1);
       
       // Check if it's end of generation
       if (llama_vocab_is_eog(vocab, new_token)) {
         break;
       }
       
-      // Convert token to text
-      char piece[256];
-      int n_chars = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
-      
+      // Convert token to text with dynamic buffer allocation
+      std::vector<char> piece(512);  // Start with larger buffer
+      int n_chars = llama_token_to_piece(vocab, new_token, piece.data(), piece.size(), 0, true);
+
+      // If buffer too small, resize and retry
+      if (n_chars < 0) {
+        piece.resize(std::abs(n_chars) + 1);  // +1 for null terminator
+        n_chars = llama_token_to_piece(vocab, new_token, piece.data(), piece.size(), 0, true);
+      }
+
       if (n_chars > 0) {
-        result.append(piece, n_chars);
+        result.append(piece.data(), n_chars);
+      } else if (n_chars < 0) {
+        // If still failing, log warning and skip this token
+        warning("Failed to convert token to text, skipping token");
+        continue;
       }
       
+      // Accept the token for sampling history
+      llama_sampler_accept(sampler, new_token);
+
       // Prepare next batch with the new token
       batch = llama_batch_get_one(&new_token, 1);
-      
+
       // Process the new token
       if (llama_decode(edge_ctx->ctx, batch)) {
         break;
       }
     }
-    
+
+    // Clean up sampler
+    llama_sampler_free(sampler);
+
     return result;
     
   } catch (const std::exception& e) {
@@ -193,17 +300,16 @@ std::string edge_completion_internal(SEXP model_ptr, std::string prompt, int n_p
 // [[Rcpp::export]]
 void edge_free_model_internal(SEXP model_ptr) {
   try {
+    if (TYPEOF(model_ptr) != EXTPTRSXP) {
+      warning("Invalid model pointer type");
+      return;
+    }
+
     XPtr<EdgeModelContext> edge_ctx(model_ptr);
-    
-    if (edge_ctx->ctx) {
-      llama_free(edge_ctx->ctx);
-      edge_ctx->ctx = NULL;
+    if (edge_ctx.get() != nullptr) {
+      edge_ctx->cleanup();
     }
-    if (edge_ctx->model) {
-      llama_model_free(edge_ctx->model);
-      edge_ctx->model = NULL;
-    }
-    
+
   } catch (const std::exception& e) {
     warning("Error freeing model: " + std::string(e.what()));
   }
@@ -227,17 +333,28 @@ List edge_completion_stream_internal(SEXP model_ptr, std::string prompt, Functio
     }
     
     XPtr<EdgeModelContext> edge_ctx(model_ptr);
-    
-    if (!edge_ctx->is_valid()) {
-      stop("Invalid model context");
+
+    if (!edge_ctx->is_valid() || edge_ctx->ctx == nullptr || edge_ctx->model == nullptr) {
+      stop("Invalid model context or null pointers");
     }
-    
+
+    // Validate input parameters
+    if (n_predict <= 0) {
+      stop("n_predict must be positive");
+    }
+    if (temperature < 0.0 || temperature > 2.0) {
+      stop("Temperature must be between 0.0 and 2.0");
+    }
+    if (top_p <= 0.0 || top_p > 1.0) {
+      stop("top_p must be between 0.0 and 1.0");
+    }
+
     // Get vocabulary from model
     const struct llama_vocab* vocab = llama_model_get_vocab(edge_ctx->model);
     if (!vocab) {
       stop("Failed to get vocabulary from model");
     }
-    
+
     // Tokenize the prompt - first get the number of tokens needed
     const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), (int32_t)prompt.size(), NULL, 0, true, true);
     
@@ -263,28 +380,24 @@ List edge_completion_stream_internal(SEXP model_ptr, std::string prompt, Functio
     std::vector<std::string> tokens_generated;
     int tokens_count = 0;
     bool stopped_early = false;
-    
-    // Generate tokens one by one and stream them
+
+    // Create sampler chain for streaming
+    auto sampler_chain_params = llama_sampler_chain_default_params();
+    auto * sampler = llama_sampler_chain_init(sampler_chain_params);
+
+    // Add samplers for quality generation
+    if (top_p < 1.0f) {
+      llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+    }
+    if (temperature > 0.0f) {
+      llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    }
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(12345)); // Random seed
+
+    // Generate tokens one by one and stream them with proper sampling
     for (int i = 0; i < n_predict; ++i) {
-      // Get logits from the context
-      const float* logits = llama_get_logits_ith(edge_ctx->ctx, -1);
-      if (!logits) {
-        stopped_early = true;
-        break;
-      }
-      
-      // Get vocabulary size using the correct API
-      const int n_vocab = llama_vocab_n_tokens(vocab);
-      llama_token new_token = 0;
-      float max_logit = logits[0];
-      
-      // Simple greedy sampling (could be enhanced with temperature/top_p)
-      for (int j = 1; j < n_vocab; ++j) {
-        if (logits[j] > max_logit) {
-          max_logit = logits[j];
-          new_token = j;
-        }
-      }
+      // Sample next token using the sampler chain
+      llama_token new_token = llama_sampler_sample(sampler, edge_ctx->ctx, -1);
       
       // Check if it's end of generation
       if (llama_vocab_is_eog(vocab, new_token)) {
@@ -292,13 +405,19 @@ List edge_completion_stream_internal(SEXP model_ptr, std::string prompt, Functio
         break;
       }
       
-      // Convert token to text
-      char piece[256];
-      int n_chars = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, true);
-      
+      // Convert token to text with dynamic buffer allocation
+      std::vector<char> piece(512);  // Start with larger buffer
+      int n_chars = llama_token_to_piece(vocab, new_token, piece.data(), piece.size(), 0, true);
+
+      // If buffer too small, resize and retry
+      if (n_chars < 0) {
+        piece.resize(std::abs(n_chars) + 1);  // +1 for null terminator
+        n_chars = llama_token_to_piece(vocab, new_token, piece.data(), piece.size(), 0, true);
+      }
+
       std::string token_text = "";
       if (n_chars > 0) {
-        token_text = std::string(piece, n_chars);
+        token_text = std::string(piece.data(), n_chars);
         full_response += token_text;
         tokens_generated.push_back(token_text);
         tokens_count++;
@@ -325,11 +444,18 @@ List edge_completion_stream_internal(SEXP model_ptr, std::string prompt, Functio
         } catch (const std::exception& e) {
           warning("Callback error: " + std::string(e.what()));
         }
+      } else if (n_chars < 0) {
+        // If still failing, log warning and skip this token
+        warning("Failed to convert token to text, skipping token");
+        continue;
       }
-      
+
+      // Accept the token for sampling history
+      llama_sampler_accept(sampler, new_token);
+
       // Prepare next batch with the new token
       batch = llama_batch_get_one(&new_token, 1);
-      
+
       // Process the new token
       if (llama_decode(edge_ctx->ctx, batch)) {
         stopped_early = true;
@@ -351,7 +477,10 @@ List edge_completion_stream_internal(SEXP model_ptr, std::string prompt, Functio
     } catch (const std::exception& e) {
       warning("Final callback error: " + std::string(e.what()));
     }
-    
+
+    // Clean up sampler
+    llama_sampler_free(sampler);
+
     // Return summary information
     return List::create(
       Named("full_response") = full_response,
@@ -373,4 +502,11 @@ void set_llama_logging(bool enabled) {
   g_suppress_console_output = !enabled;
   // Re-set the callback to ensure it takes effect
   llama_log_set(quiet_log_callback, NULL);
+}
+
+// Package initialization function - called when the package is loaded
+// [[Rcpp::init]]
+void edgemodelr_init(DllInfo *dll) {
+  // Don't initialize llama.cpp during package loading to avoid segfaults
+  // Initialization will happen lazily when first needed
 }

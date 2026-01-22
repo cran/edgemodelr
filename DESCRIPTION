@@ -1,15 +1,30 @@
 Package: edgemodelr
 Type: Package
-Title: Local Language Model Inference
-Version: 0.1.0
-Authors@R: person("Pawan Rama", "Mali", email = "prm@outlook.in", role = c("aut", "cre"))
-Author: Pawan Rama Mali [aut, cre]
+Title: Local Large Language Model Inference Engine
+Version: 0.1.4
+Authors@R: c(
+    person("Pawan Rama", "Mali", email = "prm@outlook.in", role = c("aut", "cre", "cph")),
+    person("Georgi", "Gerganov", role = c("aut", "cph"), comment = "Author of llama.cpp and GGML library"),
+    person("The ggml authors", role = "cph", comment = "llama.cpp and GGML contributors"),
+    person("Jeffrey", "Quesnelle", role = c("ctb", "cph"), comment = "YaRN RoPE implementation"),
+    person("Bowen", "Peng", role = c("ctb", "cph"), comment = "YaRN RoPE implementation"),
+    person("pi6am", role = "ctb", comment = "DRY sampler from Koboldcpp"),
+    person("Ivan", "Yurchenko", role = "ctb", comment = "Z-algorithm implementation"),
+    person("Dirk", "Eddelbuettel", role = "ctb", comment = "Connection handling fix"))
+Author: Pawan Rama Mali [aut, cre, cph],
+  Georgi Gerganov [aut, cph] (Author of llama.cpp and GGML library),
+  The ggml authors [cph] (llama.cpp and GGML contributors),
+  Jeffrey Quesnelle [ctb, cph] (YaRN RoPE implementation),
+  Bowen Peng [ctb, cph] (YaRN RoPE implementation),
+  pi6am [ctb] (DRY sampler from Koboldcpp),
+  Ivan Yurchenko [ctb] (Z-algorithm implementation),
+  Dirk Eddelbuettel [ctb] (Connection handling fix)
 Maintainer: Pawan Rama Mali <prm@outlook.in>
 Description: Enables R users to run large language models locally using 'GGUF' model files
     and the 'llama.cpp' inference engine. Provides a complete R interface for loading models,
     generating text completions, and streaming responses in real-time. Supports local
     inference without requiring cloud APIs or internet connectivity, ensuring complete
-    data privacy and control. References: 'Gerganov' et al. (2023) <https://github.com/ggml-org/llama.cpp>.
+    data privacy and control. Based on the 'llama.cpp' project by Georgi Gerganov (2023) <https://github.com/ggml-org/llama.cpp>.
 License: MIT + file LICENSE
 URL: https://github.com/PawanRamaMali/edgemodelr
 BugReports: https://github.com/PawanRamaMali/edgemodelr/issues
@@ -17,14 +32,14 @@ Encoding: UTF-8
 Depends: R (>= 4.0)
 LinkingTo: Rcpp
 Imports: Rcpp (>= 1.0.0), utils, tools
-Suggests: testthat (>= 3.0.0), knitr, rmarkdown
+Suggests: testthat (>= 3.0.0), knitr, rmarkdown, curl
 SystemRequirements: C++17, GNU make or equivalent for building
-Note: This package includes a self-contained 'llama.cpp' implementation
-        resulting in a larger installation size (~56MB) to provide
-        complete functionality without external dependencies.
+Note: Package includes self-contained 'llama.cpp' implementation
+        (~56MB) for complete functionality without external
+        dependencies.
 Config/testthat/edition: 3
 RoxygenNote: 7.3.3
 NeedsCompilation: yes
-Packaged: 2025-09-17 19:22:58 UTC; aeroe
+Packaged: 2026-01-21 16:55:21 UTC; aeroe
 Repository: CRAN
-Date/Publication: 2025-09-22 12:00:08 UTC
+Date/Publication: 2026-01-22 08:10:08 UTC

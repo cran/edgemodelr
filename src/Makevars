@@ -1,14 +1,14 @@
-PKG_CPPFLAGS = -I../inst/include -I./llama -I./ggml -I./ggml/ggml-cpu -DUSING_R=1 -include r_output_redirect.h
-PKG_CXXFLAGS = -DNDEBUG -DGGML_USE_CPU 
+PKG_CPPFLAGS = -I../inst/include -I./llama -I./ggml -I./ggml/ggml-cpu -DUSING_R=1 -DGGML_BUILD_FOR_R
+PKG_CXXFLAGS = -DNDEBUG -DGGML_USE_CPU
 PKG_CFLAGS = -DNDEBUG -DGGML_USE_CPU
 
-# Override warnings for ggml source files
+# Cross-platform configuration without OpenMP for stability
 GGML_CXXFLAGS = $(PKG_CXXFLAGS) -fPIC
 GGML_CFLAGS = $(PKG_CFLAGS) -DUSING_R=1 -fPIC
 PKG_LIBS = $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 
-# Complete static list of ALL object files - no variables, no wildcards
-OBJECTS = bindings.o RcppExports.o \
+# Core object files (common to all architectures)
+CORE_OBJECTS = bindings.o RcppExports.o \
 	ggml/ggml.o ggml/ggml-alloc.o ggml/gguf.o \
 	ggml/ggml-backend.o ggml/ggml-backend-reg.o \
 	ggml/ggml-quants.o ggml/ggml-threading.o ggml/ggml-opt.o \
@@ -21,9 +21,18 @@ OBJECTS = bindings.o RcppExports.o \
 	llama/unicode-data.o llama/unicode.o \
 	ggml/ggml-cpu/ggml-cpu-c.o ggml/ggml-cpu/ggml-cpu-cpp.o ggml/ggml-cpu/ops.o \
 	ggml/ggml-cpu/binary-ops.o ggml/ggml-cpu/unary-ops.o ggml/ggml-cpu/vec.o \
-	ggml/ggml-cpu/traits.o ggml/ggml-cpu/repack.o ggml/ggml-cpu/quants.o \
-	ggml/ggml-cpu/arch/x86/cpu-feats.o ggml/ggml-cpu/arch/x86/quants.o \
-	ggml/ggml-cpu/arch/x86/repack.o
+	ggml/ggml-cpu/traits.o ggml/ggml-cpu/repack.o ggml/ggml-cpu/quants.o
+
+# Platform-independent configuration
+# Use generic CPU implementation for all architectures to ensure portability
+GGML_CXXFLAGS += -DGGML_CPU_GENERIC
+GGML_CFLAGS += -DGGML_CPU_GENERIC
+
+# No architecture-specific objects
+ARCH_OBJECTS =
+
+# Complete objects list with architecture support
+OBJECTS = $(CORE_OBJECTS) $(ARCH_OBJECTS)
 
 all: $(SHLIB)
 
@@ -37,14 +46,14 @@ ggml/ggml-cpu/ggml-cpu-c.o: ggml/ggml-cpu/ggml-cpu.c
 ggml/ggml-cpu/ggml-cpu-cpp.o: ggml/ggml-cpu/ggml-cpu.cpp
 	$(CXX) $(ALL_CPPFLAGS) $(GGML_CXXFLAGS) -c $< -o $@
 
-# Standard compilation rules for main source files (with suppression for Rcpp and format)
+# Standard compilation rules for main source files
 bindings.o: bindings.cpp
 	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -fPIC -c $< -o $@
 
 RcppExports.o: RcppExports.cpp
 	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -fPIC -c $< -o $@
 
-# Special rules for GGML/LLAMA files with warning suppression
+# Special rules for GGML/LLAMA files
 ggml/%.o: ggml/%.c
 	$(CC) $(ALL_CPPFLAGS) $(GGML_CFLAGS) -c $< -o $@
 
@@ -53,6 +62,8 @@ ggml/%.o: ggml/%.cpp
 
 llama/%.o: llama/%.cpp
 	$(CXX) $(ALL_CPPFLAGS) $(GGML_CXXFLAGS) -c $< -o $@
+
+# No architecture-specific rules needed - using generic CPU implementation
 
 # Standard fallback rules
 %.o: %.c

@@ -1,44 +1,33 @@
-PKG_CPPFLAGS = -I../inst/include -I./llama -I./ggml -I./ggml/ggml-cpu -DUSING_R=1 -include r_output_redirect.h
-PKG_CXXFLAGS = -std=gnu++17 -O2 -DNDEBUG -DNOMINMAX -D_USE_MATH_DEFINES -DGGML_USE_CPU
+PKG_CPPFLAGS = -I../inst/include -I./llama -I./ggml -I./ggml/ggml-cpu -DUSING_R=1 -DGGML_BUILD_FOR_R
+PKG_CXXFLAGS = -DNDEBUG -DGGML_USE_CPU
 PKG_CFLAGS = -DNDEBUG -DGGML_USE_CPU
-PKG_LIBS = 
 
-# Override warnings for ggml source files
-GGML_CXXFLAGS = $(PKG_CXXFLAGS)
-GGML_CFLAGS = $(PKG_CFLAGS) -DUSING_R=1
+# Cross-platform configuration without OpenMP for stability
+GGML_CXXFLAGS = $(PKG_CXXFLAGS) -fPIC
+GGML_CFLAGS = $(PKG_CFLAGS) -DUSING_R=1 -fPIC
+PKG_LIBS = $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 
-# Main package objects  
-OBJECTS = bindings.o RcppExports.o
+# Core object files (common to all architectures)
+CORE_OBJECTS = bindings.o RcppExports.o \
+	ggml/ggml.o ggml/ggml-alloc.o ggml/gguf.o \
+	ggml/ggml-backend.o ggml/ggml-backend-reg.o \
+	ggml/ggml-quants.o ggml/ggml-threading.o ggml/ggml-opt.o \
+	llama/llama-adapter.o llama/llama-arch.o llama/llama-batch.o llama/llama-chat.o \
+	llama/llama-context.o llama/llama-cparams.o llama/llama-grammar.o llama/llama-graph.o \
+	llama/llama-hparams.o llama/llama-impl.o llama/llama-io.o llama/llama-kv-cache-iswa.o \
+	llama/llama-kv-cache.o llama/llama-memory-hybrid.o llama/llama-memory-recurrent.o \
+	llama/llama-memory.o llama/llama-mmap.o llama/llama-model-loader.o llama/llama-model-saver.o llama/llama-model.o \
+	llama/llama-quant.o llama/llama-sampling.o llama/llama-vocab.o llama/llama.o \
+	llama/unicode-data.o llama/unicode.o \
+	ggml/ggml-cpu/ggml-cpu-c.o ggml/ggml-cpu/ggml-cpu-cpp.o ggml/ggml-cpu/ops.o \
+	ggml/ggml-cpu/binary-ops.o ggml/ggml-cpu/unary-ops.o ggml/ggml-cpu/vec.o \
+	ggml/ggml-cpu/traits.o ggml/ggml-cpu/repack.o ggml/ggml-cpu/quants.o
 
-# Include ALL llama.cpp source files
-LLAMA_SOURCES = $(wildcard llama/*.cpp)
-LLAMA_OBJS = $(LLAMA_SOURCES:.cpp=.o)
+# Architecture-specific objects for x86_64 (Windows only)
+ARCH_OBJECTS = ggml/ggml-cpu/arch/x86/quants.o ggml/ggml-cpu/arch/x86/repack.o ggml/ggml-cpu/arch/x86/cpu-feats.o
 
-# Include core GGML source files 
-GGML_SOURCES = ggml/ggml.c ggml/ggml-alloc.c ggml/ggml-backend.cpp ggml/ggml-backend-reg.cpp \
-               ggml/ggml-quants.c ggml/ggml-threading.cpp ggml/ggml-opt.cpp ggml/gguf.cpp
-
-# Complete CPU backend implementation 
-GGML_CPU_SOURCES = ggml/ggml-cpu/ops.cpp ggml/ggml-cpu/binary-ops.cpp \
-                   ggml/ggml-cpu/unary-ops.cpp ggml/ggml-cpu/vec.cpp ggml/ggml-cpu/traits.cpp \
-                   ggml/ggml-cpu/repack.cpp ggml/ggml-cpu/quants.c
-
-# Architecture-specific files for x86 (Windows)
-GGML_CPU_ARCH_SOURCES = ggml/ggml-cpu/arch/x86/cpu-feats.cpp ggml/ggml-cpu/arch/x86/quants.c \
-                        ggml/ggml-cpu/arch/x86/repack.cpp
-               
-GGML_OBJS = $(GGML_SOURCES:.cpp=.o)
-GGML_OBJS := $(GGML_OBJS:.c=.o)
-
-GGML_CPU_OBJS = $(GGML_CPU_SOURCES:.cpp=.o)
-GGML_CPU_OBJS := $(GGML_CPU_OBJS:.c=.o)
-
-GGML_CPU_ARCH_OBJS = $(GGML_CPU_ARCH_SOURCES:.cpp=.o)
-GGML_CPU_ARCH_OBJS := $(GGML_CPU_ARCH_OBJS:.c=.o)
-
-# Build both ggml-cpu.c and ggml-cpu.cpp with different object names
-OBJECTS += $(LLAMA_OBJS) $(GGML_OBJS) $(GGML_CPU_OBJS) $(GGML_CPU_ARCH_OBJS) \
-           ggml/ggml-cpu/ggml-cpu-c.o ggml/ggml-cpu/ggml-cpu-cpp.o
+# Complete objects list with architecture support
+OBJECTS = $(CORE_OBJECTS) $(ARCH_OBJECTS)
 
 all: $(SHLIB)
 
@@ -54,10 +43,10 @@ ggml/ggml-cpu/ggml-cpu-cpp.o: ggml/ggml-cpu/ggml-cpu.cpp
 
 # Standard compilation rules for main source files
 bindings.o: bindings.cpp
-	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -c $< -o $@
+	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -fPIC -c $< -o $@
 
 RcppExports.o: RcppExports.cpp
-	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -c $< -o $@
+	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -fPIC -c $< -o $@
 
 # Special rules for GGML/LLAMA files
 ggml/%.o: ggml/%.c
@@ -69,9 +58,16 @@ ggml/%.o: ggml/%.cpp
 llama/%.o: llama/%.cpp
 	$(CXX) $(ALL_CPPFLAGS) $(GGML_CXXFLAGS) -c $< -o $@
 
-# Compilation rules
-%.o: %.c
-	$(CC) $(ALL_CPPFLAGS) $(ALL_CFLAGS) -c $< -o $@
+# Architecture-specific rules
+ggml/ggml-cpu/arch/x86/%.o: ggml/ggml-cpu/arch/x86/%.c
+	$(CC) $(ALL_CPPFLAGS) $(GGML_CFLAGS) -c $< -o $@
 
-%.o: %.cpp  
-	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -c $< -o $@
+ggml/ggml-cpu/arch/x86/%.o: ggml/ggml-cpu/arch/x86/%.cpp
+	$(CXX) $(ALL_CPPFLAGS) $(GGML_CXXFLAGS) -c $< -o $@
+
+# Standard fallback rules
+%.o: %.c
+	$(CC) $(ALL_CPPFLAGS) $(ALL_CFLAGS) -fPIC -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(ALL_CPPFLAGS) $(ALL_CXXFLAGS) -fPIC -c $< -o $@
