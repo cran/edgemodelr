@@ -1,7 +1,7 @@
 Package: edgemodelr
 Type: Package
 Title: Local Large Language Model Inference Engine
-Version: 0.1.6
+Version: 0.2.0
 Authors@R: c(
     person("Pawan Rama", "Mali", email = "prm@outlook.in", role = c("aut", "cre", "cph")),
     person("Georgi", "Gerganov", role = c("aut", "cph"), comment = "Author of llama.cpp and GGML library"),
@@ -23,7 +23,7 @@ Encoding: UTF-8
 Depends: R (>= 4.0)
 LinkingTo: Rcpp
 Imports: Rcpp (>= 1.0.0), utils, tools
-Suggests: testthat (>= 3.0.0), knitr, rmarkdown, curl, shiny
+Suggests: testthat (>= 3.0.0), knitr, rmarkdown, curl, shiny, openssl
 SystemRequirements: GNU make or equivalent for building
 Note: Package includes self-contained 'llama.cpp' implementation
         (~56MB) for complete functionality without external
@@ -31,7 +31,7 @@ Note: Package includes self-contained 'llama.cpp' implementation
 Config/testthat/edition: 3
 RoxygenNote: 7.3.3
 NeedsCompilation: yes
-Packaged: 2026-02-06 13:24:41 UTC; alpine
+Packaged: 2026-02-24 11:49:44 UTC; aeroe
 Author: Pawan Rama Mali [aut, cre, cph],
   Georgi Gerganov [aut, cph] (Author of llama.cpp and GGML library),
   The ggml authors [cph] (llama.cpp and GGML contributors),
@@ -42,4 +42,4 @@ Author: Pawan Rama Mali [aut, cre, cph],
   Dirk Eddelbuettel [ctb, rev]
 Maintainer: Pawan Rama Mali <prm@outlook.in>
 Repository: CRAN
-Date/Publication: 2026-02-07 06:10:49 UTC
+Date/Publication: 2026-02-26 00:50:02 UTC
