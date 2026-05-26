@@ -1,3 +1,188 @@
+# edgemodelr 0.4.1
+
+## CRAN Resubmission Fixes
+
+* **Stderr references in compiled objects** (CRAN auto-check NOTE on
+  Debian): the previous CRAN cleanup (commit d8870bd) added stdio
+  suppression to 7 upstream files but missed `ggml/ggml.c` and
+  `ggml/ggml-opt.cpp`. Both now include the same `#ifdef USING_R`
+  macro block that neutralizes `printf`, `fprintf`, `fputs`, `fflush`,
+  `stderr`, and `stdout`. These calls were diagnostic-only and were
+  already silent at runtime via the installed log callback; now the
+  symbols never reach the compiled object files either.
+
+# edgemodelr 0.4.0
+
+## Structured Output, Embeddings, RAG, and API Server
+
+### New Features
+
+* **Grammar-constrained generation** (`edge_grammar_completion()`): Force model
+  output to conform to a GBNF grammar specification. Ensures valid, parseable
+  structured output (JSON, enums, numbers, etc.) using llama.cpp's native
+  grammar sampler.
+
+* **JSON schema helper** (`edge_json_grammar()`): Convert a simple R list
+  schema into a GBNF grammar string. Supports string, number, integer,
+  boolean fields and enum (character vector) constraints.
+
+* **Structured data extraction** (`edge_extract()`): High-level function that
+  combines prompt construction with grammar-constrained generation to extract
+  structured data from text. Returns a parsed R list (requires `jsonlite`).
+
+* **Text classification** (`edge_classify()`): Classify text into predefined
+  categories using grammar constraints. Supports single text and batch
+  (vectorized) classification. Output is guaranteed to be one of the
+  specified categories.
+
+* **Text embeddings** (`edge_embeddings()`): Extract dense vector embeddings
+  from any loaded model. Returns a numeric matrix (n_texts x n_embd) suitable
+  for clustering, semantic search, similarity computation, and RAG pipelines.
+  Supports optional L2 normalization.
+
+* **Cosine similarity** (`edge_similarity()`, `edge_similarity_matrix()`):
+  Compute pairwise cosine similarity between embedding vectors. Matrix version
+  efficiently computes all-pairs similarity using normalized matrix multiply.
+
+* **Embedding dimension query** (`edge_model_n_embd()`): Query the embedding
+  dimension of a loaded model.
+
+* **Batch processing** (`edge_map()`): Apply a prompt template over a vector
+  of texts with progress reporting. Supports both string templates with
+  `{text}` placeholder and custom prompt functions. Optional grammar
+  constraint for structured batch output.
+
+* **Batch extraction** (`edge_extract_batch()`): Extract structured data from
+  multiple texts, returning a data frame with one row per input.
+
+* **RAG document indexing** (`edge_index_documents()`): Build a semantic
+  embedding index from a directory of text files or a character vector.
+  Automatic chunking with configurable size and overlap.
+
+* **RAG semantic search** (`edge_search()`): Find the most relevant text
+  chunks for a query using cosine similarity over the embedding index.
+
+* **RAG question answering** (`edge_ask()`): Retrieval-augmented generation
+  that retrieves relevant context from an index and generates a grounded
+  answer. Supports custom system prompts and optional context return for
+  debugging/transparency.
+
+* **Plumber API server** (`edge_serve()`): Serve a model as a local
+  OpenAI-compatible REST API. Endpoints: `/v1/completions`,
+  `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/health`.
+  Supports optional API key authentication and CORS. Requires `plumber`.
+
+* **Qwen3 model family** in `edge_list_models()`: Added Qwen3-0.6B, 1.7B,
+  4B, and 8B pre-configured entries from the unsloth GGUF repository.
+
+* **Friendly names in `edge_download_model()`**: Now accepts model names from
+  `edge_list_models()` (e.g., `edge_download_model("Qwen3-0.6B")`) in addition
+  to HuggingFace repo IDs. Filename is auto-resolved from the model registry.
+
+* **httr download fallback**: `.robust_download()` now tries `httr::GET` before
+  R's `download.file`, improving reliability on corporate networks with custom
+  SSL certificates or proxy configurations.
+
+* **SIMD optimization warning**: On package load, warns if running without SIMD
+  (generic mode) and suggests reinstalling from source with
+  `EDGEMODELR_SIMD=NATIVE` for faster inference.
+
+### Bug Fixes
+
+* **Fixed grammar-constrained generation failures** (issue #41):
+  `edge_grammar_completion()`, `edge_extract()`, and `edge_extract_batch()` were
+  unusable due to two bugs. First, `edge_json_grammar()` emitted rule names like
+  `field_1` containing underscores, which llama.cpp's grammar parser rejects
+  (only `[a-zA-Z0-9-]` is allowed in rule identifiers). Renamed to `field-1`.
+  Second, `llama_sampler_accept()` throws "Unexpected empty grammar stack" when
+  a token fully satisfies the grammar; the binding now catches this and
+  terminates cleanly, same as end-of-generation handling.
+
+* **Fixed crash from silent context size override** (issue #40 item 11):
+  Removed the auto-reduction of `n_ctx` for small models that silently changed
+  the user's requested context size. This caused segfaults when prompts exceeded
+  the reduced context. Context is now used as-is. Minimum `n_ctx` lowered from
+  512 to 128 for short-task use cases.
+
+* **Fixed prompt echo in completion output** (issue #40 item 1):
+  `edge_completion()` previously returned `prompt + generated_text`. Now returns
+  only the generated text, matching user expectations.
+
+* **Added prompt length validation**: All completion functions now validate that
+  the tokenized prompt fits within the model's context window before calling
+  `llama_decode()`. Exceeding the context now raises a clear R error instead of
+  crashing the process.
+
+* **Model-native chat templates** (issue #40 item 7): New
+  `edge_chat_completion()` function reads the model's chat template from GGUF
+  metadata (via `llama_chat_apply_template`) and formats messages correctly for
+  each model architecture (ChatML, Llama, Gemma, etc.). `build_chat_prompt()`
+  updated to accept an optional `ctx` parameter for native template formatting,
+  with ChatML as the generic fallback (replacing the old `Human:/Assistant:`
+  format).
+
+### Use Cases Unlocked
+
+* **Sentiment analysis**: `edge_classify(ctx, text, c("positive", "negative", "neutral"))`
+* **Entity extraction**: `edge_extract(ctx, text, list(name = "string", role = "string"))`
+* **Data labeling**: Batch classify thousands of rows with guaranteed valid labels
+* **Semantic search**: Embed documents and queries, find nearest neighbors
+* **Document clustering**: Compute similarity matrices, feed to hclust/kmeans
+* **RAG foundations**: Embed corpus, retrieve relevant context for generation
+
+# edgemodelr 0.3.0
+
+## CUDA GPU Support and Qwen3 Tokenizer Fix
+
+### New Features
+
+* **CUDA GPU acceleration** (Windows): New `edge_install_cuda()` and
+  `edge_install_cuda_toolkit()` functions set up GPU inference automatically.
+  - `edge_install_cuda()` downloads the matching `ggml-cuda` dynamic backend
+    from llama.cpp releases and extracts the companion `ggml-base.dll` /
+    `ggml.dll` runtime libraries.
+  - `edge_install_cuda_toolkit()` copies `nvcudart_hybrid64.dll` from the
+    Windows DriverStore (already on any NVIDIA-driver machine, no download
+    required) and fetches `cublas64` / `cublasLt64` from NVIDIA's redistrib
+    server.
+  - `edge_reload_cuda()` activates the CUDA backend in the current R session
+    without restarting R.
+  - `edge_cuda_info()` reports whether CUDA is installed and active.
+  - Pass `n_gpu_layers = -1L` to `edge_load_model()` for full GPU offload.
+  - Tested on NVIDIA RTX 5070 Ti (Blackwell sm_120, CUDA 13.1, 12 GB VRAM):
+    Qwen3-14B loads in 3.4 s with full VRAM offload.
+
+* **Updated llama.cpp to build b8179 (GGML 0.9.7)**: Brings all upstream
+  model architecture updates, sampler improvements, and quantization fixes.
+
+### Bug Fixes
+
+* **Qwen3 / QWEN2 tokenizer 40-minute load time** (8000× speedup): The
+  QWEN2 byte-level regex pattern caused GCC's `std::regex` to spend 40+
+  minutes in exponential backtracking. Added a hand-written fast path
+  `unicode_regex_split_custom_qwen2()` in `unicode.cpp`, matching the logic
+  of the existing llama-3 fast path. Qwen3-14B now loads in 0.3 s on CPU
+  (3.4 s on GPU including VRAM transfer). Covers QWEN2 and QWEN3.5 variants.
+
+### CRAN Compliance
+
+* Replaced `abort()` in `ggml_abort()` with `raise(SIGABRT)` under
+  `#ifdef USING_R`; replaces `abort()` token in `ggml.cpp` with
+  `std::terminate()`.
+* Guarded `ggml_print_backtrace()` body and `fflush(stdout)` /
+  `fprintf(stderr, …)` in `ggml_abort()` with `#ifndef USING_R` to remove
+  `_Exit`, `stdout`, and `stderr` symbol references from `ggml.o` on macOS.
+* Added `#define _GNU_SOURCE` to `ggml-cpu.c` (required for `SCHED_BATCH`,
+  `CPU_ZERO`, `pthread_setaffinity_np` on Linux).
+* `CXX_STD = CXX17` replaces `-std=c++17` in `PKG_CXXFLAGS` in both
+  `Makevars` and `Makevars.win`.
+* `-fno-builtin-printf` added to `GGML_CFLAGS` to suppress
+  `printf → puts` optimizations.
+* Man pages added for `edge_install_cuda`, `edge_install_cuda_toolkit`,
+  `edge_reload_cuda`, `edge_cuda_info`.
+
+---
+
 # edgemodelr 0.2.0
 
 ## SIMD Optimizations for Faster CPU Inference

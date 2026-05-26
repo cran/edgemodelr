@@ -2,7 +2,8 @@
 #'
 #' @param model_path Path to a .gguf model file
 #' @param n_ctx Maximum context length (default: 2048)
-#' @param n_gpu_layers Number of layers to offload to GPU (default: 0, CPU-only)
+#' @param n_gpu_layers Number of layers to offload to GPU (default: 0, CPU-only).
+#'   Use -1 to offload all layers (requires CUDA backend via edge_install_cuda()).
 #' @param n_threads Number of CPU threads for inference (default: NULL = use all hardware threads).
 #'   Set to a lower value to leave cores free for other tasks.
 #' @param flash_attn Enable flash attention for faster inference (default: TRUE).
@@ -33,7 +34,7 @@
 #' }
 #' }
 #' @export
-edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_threads = NULL, flash_attn = TRUE) {
+edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_threads = NULL, flash_attn = TRUE, embeddings = FALSE) {
   if (!file.exists(model_path)) {
     stop("Model file does not exist: ", model_path, "\n",
          "Try these options:\n",
@@ -55,8 +56,8 @@ edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_thre
   if (!is.numeric(n_ctx) || n_ctx <= 0) {
     stop("n_ctx must be a positive integer")
   }
-  if (!is.numeric(n_gpu_layers) || n_gpu_layers < 0) {
-    stop("n_gpu_layers must be a non-negative integer")
+  if (!is.numeric(n_gpu_layers) || (n_gpu_layers < 0 && n_gpu_layers != -1)) {
+    stop("n_gpu_layers must be a non-negative integer, or -1 to offload all layers to GPU")
   }
   # Validate n_threads: NULL means auto-detect (passed as 0L)
   if (!is.null(n_threads)) {
@@ -81,17 +82,8 @@ edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_thre
     }
   }
 
-  # Auto-optimize context for small models (< 2GB)
-  if (model_size_mb < 2000 && n_ctx == 2048) {
-    # Small models work best with smaller contexts for faster inference
-    optimal_ctx <- if (model_size_mb < 1000) 1024 else 1536
-    n_ctx <- optimal_ctx
-    message("Optimized context size to ", n_ctx, " for small model (", round(model_size_mb, 1), "MB). ",
-            "Use n_ctx parameter to override.")
-  }
-
-  # Clamp to reasonable range
-  n_ctx <- max(512, min(n_ctx, 32768))
+  # Clamp to reasonable range (allow as low as 128 for short tasks)
+  n_ctx <- max(128, min(n_ctx, 32768))
 
   # Warn about large contexts
   if (n_ctx > 8192) {
@@ -99,12 +91,16 @@ edge_load_model <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_thre
   }
 
   # Try to load the model using the raw Rcpp function
+  # -1 means "all layers on GPU"; translate to a large number for llama.cpp
+  n_gpu_layers_actual <- if (n_gpu_layers == -1) .Machine$integer.max else as.integer(n_gpu_layers)
+
   ctx <- tryCatch({
     edge_load_model_internal(normalizePath(model_path),
                              as.integer(n_ctx),
-                             as.integer(n_gpu_layers),
+                             n_gpu_layers_actual,
                              as.integer(if (is.null(n_threads)) 0L else n_threads),
-                             as.logical(flash_attn))
+                             as.logical(flash_attn),
+                             as.logical(embeddings))
   }, error = function(e) {
     # Provide more context about what went wrong
     if (grepl("llama_load_model_from_file", e$message)) {
@@ -263,7 +259,7 @@ is_valid_model <- function(ctx) {
 #' }
 #' }
 #' @export
-edge_download_model <- function(model_id, filename, cache_dir = NULL, force_download = FALSE,
+edge_download_model <- function(model_id, filename = NULL, cache_dir = NULL, force_download = FALSE,
                                 verify_checksum = TRUE, expected_sha256 = NULL,
                                 trust_first_use = FALSE, verbose = TRUE) {
   # Parameter validation
@@ -273,11 +269,26 @@ edge_download_model <- function(model_id, filename, cache_dir = NULL, force_down
   if (nchar(model_id) == 0) {
     stop("model_id cannot be empty")
   }
-  if (is.null(filename) || !is.character(filename) || length(filename) != 1) {
-    stop("filename must be a string")
+
+  # Check if model_id is a friendly name from edge_list_models()
+  resolved <- edge_resolve_model_name(model_id)
+  if (!is.na(resolved)) {
+    models <- edge_list_models()
+    row <- models[models$name == resolved, ]
+    if (verbose) message("Resolved '", model_id, "' to: ", resolved,
+                          " (", row$size, ")")
+    # Use the pre-configured URL and filename
+    if (is.null(filename)) filename <- row$filename
+    return(edge_download_url(row$download_url, filename = filename,
+                              cache_dir = cache_dir, force_download = force_download,
+                              verbose = verbose))
   }
-  if (nchar(filename) == 0) {
-    stop("filename cannot be empty")
+
+  # Standard HuggingFace repo_id/filename path
+  if (is.null(filename) || !is.character(filename) || length(filename) != 1 || nchar(filename) == 0) {
+    stop("filename is required when model_id is a HuggingFace repo ID.\n",
+         "Example: edge_download_model('unsloth/Qwen3-0.6B-GGUF', 'Qwen3-0.6B-Q4_K_M.gguf')\n",
+         "Or use a friendly name: edge_download_model('Qwen3-0.6B')")
   }
 
   # Set default cache directory using R_user_dir (CRAN compliant)
@@ -576,12 +587,41 @@ edge_download_model <- function(model_id, filename, cache_dir = NULL, force_down
     if (success) return(TRUE)
   }
 
+  # Try httr package if available (handles corporate proxies and SSL better)
+  if (requireNamespace("httr", quietly = TRUE)) {
+    if (verbose) message("Trying httr (handles corporate proxies/SSL)...")
+    success <- .download_with_httr(url, destfile, hf_token, verbose)
+    if (success) return(TRUE)
+  }
+
   # Try R's download.file with libcurl method as last resort
   if (verbose) message("Trying R download.file with libcurl...")
   success <- .download_with_r(url, destfile, hf_token, verbose, max_retries)
   if (success) return(TRUE)
 
   return(FALSE)
+}
+
+#' Download using httr package (best for corporate networks)
+#' @keywords internal
+.download_with_httr <- function(url, destfile, hf_token = "", verbose = TRUE) {
+  tryCatch({
+    headers <- list()
+    if (nchar(hf_token) > 0) {
+      headers[["Authorization"]] <- paste("Bearer", hf_token)
+    }
+    resp <- httr::GET(url,
+                       httr::write_disk(destfile, overwrite = TRUE),
+                       if (verbose) httr::progress("down") else NULL,
+                       do.call(httr::add_headers, headers),
+                       httr::config(followlocation = TRUE))
+    httr::status_code(resp) == 200 && file.exists(destfile) &&
+      file.info(destfile)$size > 1024
+  }, error = function(e) {
+    if (verbose) message("httr download failed: ", e$message)
+    if (file.exists(destfile)) try(file.remove(destfile), silent = TRUE)
+    FALSE
+  })
 }
 
 #' Download using curl command
@@ -780,7 +820,18 @@ edge_resolve_model_name <- function(model_name, models = NULL) {
     "orca-2" = "orca2-13b",
     "wizard" = "wizardlm-13b",
     "wizardlm" = "wizardlm-13b",
-    "hermes" = "hermes-13b"
+    "hermes" = "hermes-13b",
+    # Qwen3 aliases
+    "qwen3" = "Qwen3-0.6B",
+    "qwen3-0.6b" = "Qwen3-0.6B",
+    "qwen3-1.7b" = "Qwen3-1.7B",
+    "qwen3-4b" = "Qwen3-4B",
+    "qwen3-8b" = "Qwen3-8B",
+    "qwen-3" = "Qwen3-0.6B",
+    "qwen-3-0.6b" = "Qwen3-0.6B",
+    "qwen-3-1.7b" = "Qwen3-1.7B",
+    "qwen-3-4b" = "Qwen3-4B",
+    "qwen-3-8b" = "Qwen3-8B"
   )
   if (lower %in% names(aliases)) {
     canonical <- aliases[[lower]]
@@ -810,6 +861,8 @@ edge_list_models <- function() {
     name = c(
       # Small models (testing/mobile)
       "TinyLlama-1.1B", "TinyLlama-OpenOrca",
+      # Qwen3 models (new, excellent quality)
+      "Qwen3-0.6B", "Qwen3-1.7B", "Qwen3-4B", "Qwen3-8B",
       # Medium models (2-5GB)
       "llama3-8b", "mistral-7b", "llama3.2-3b", "phi3-mini",
       # Large models (7-10GB) - Direct download from GPT4All CDN
@@ -817,6 +870,7 @@ edge_list_models <- function() {
     ),
     size = c(
       "~700MB", "~700MB",
+      "~397MB", "~1.1GB", "~2.5GB", "~5.2GB",
       "~4.7GB", "~4.1GB", "~2GB", "~2.4GB",
       "~7.4GB", "~7.4GB", "~7.4GB", "~9GB"
     ),
@@ -824,6 +878,11 @@ edge_list_models <- function() {
       # HuggingFace models
       "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
       "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_K_M.gguf",
+      # Qwen3 GGUF from unsloth (no auth required)
+      "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+      "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+      "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+      "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
       # GPT4All CDN - direct download, no auth required
       "https://gpt4all.io/models/gguf/Meta-Llama-3-8B-Instruct.Q4_0.gguf",
       "https://gpt4all.io/models/gguf/mistral-7b-instruct-v0.1.Q4_0.gguf",
@@ -838,6 +897,10 @@ edge_list_models <- function() {
     filename = c(
       "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
       "tinyllama-1.1b-1t-openorca.Q4_K_M.gguf",
+      "Qwen3-0.6B-Q4_K_M.gguf",
+      "Qwen3-1.7B-Q4_K_M.gguf",
+      "Qwen3-4B-Q4_K_M.gguf",
+      "Qwen3-8B-Q4_K_M.gguf",
       "Meta-Llama-3-8B-Instruct.Q4_0.gguf",
       "mistral-7b-instruct-v0.1.Q4_0.gguf",
       "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
@@ -849,16 +912,19 @@ edge_list_models <- function() {
     ),
     use_case = c(
       "Testing", "Better Chat",
+      "Fast chat (0.6B)", "Balanced (1.7B)", "Quality chat (4B)", "Best quality (8B)",
       "General (8B)", "General (7B)", "Mobile (3B)", "Reasoning",
       "13B Chat", "13B Instruct", "13B Chat", "Code (15B)"
     ),
     source = c(
       "huggingface", "huggingface",
+      "huggingface", "huggingface", "huggingface", "huggingface",
       "gpt4all", "gpt4all", "huggingface", "huggingface",
       "gpt4all", "gpt4all", "gpt4all", "gpt4all"
     ),
     requires_auth = c(
       FALSE, FALSE,
+      FALSE, FALSE, FALSE, FALSE,
       FALSE, FALSE, FALSE, FALSE,
       FALSE, FALSE, FALSE, FALSE
     ),
@@ -1373,7 +1439,7 @@ edge_chat_stream <- function(ctx, system_prompt = NULL, max_history = 10, n_pred
 #' @param history List of conversation turns with role and content
 #' @return Formatted prompt string
 #' @export
-build_chat_prompt <- function(history) {
+build_chat_prompt <- function(history, ctx = NULL) {
   if (length(history) == 0) {
     return("")
   }
@@ -1382,21 +1448,76 @@ build_chat_prompt <- function(history) {
     stop("history must be a list of turns each with $role and $content fields")
   }
 
-  prompt_parts <- c()
-
-  for (turn in history) {
-    if (turn$role == "system") {
-      prompt_parts <- c(prompt_parts, paste("System:", turn$content))
-    } else if (turn$role == "user") {
-      prompt_parts <- c(prompt_parts, paste("Human:", turn$content))
-    } else if (turn$role == "assistant") {
-      prompt_parts <- c(prompt_parts, paste("Assistant:", turn$content))
-    }
+  # If a model context is provided, use the model's native chat template
+  if (!is.null(ctx) && is_valid_model(ctx)) {
+    return(edge_chat_apply_template_internal(ctx, history, TRUE))
   }
-  
-  # Add the start of assistant response
-  prompt <- paste(c(prompt_parts, "Assistant:"), collapse = "\n")
+
+  # Fallback: generic ChatML format (works with most models)
+  prompt_parts <- character()
+  for (turn in history) {
+    prompt_parts <- c(prompt_parts,
+      paste0("<|im_start|>", turn$role, "\n", turn$content, "<|im_end|>"))
+  }
+  prompt <- paste(c(prompt_parts, "<|im_start|>assistant\n"), collapse = "\n")
   return(prompt)
+}
+
+#' Generate a chat completion using the model's native template
+#'
+#' Formats messages using the model's built-in chat template (read from GGUF
+#' metadata), generates a completion, and returns only the assistant's response.
+#' This is the recommended way to do multi-turn chat.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param messages A list of message objects, each with \code{role} ("system",
+#'   "user", or "assistant") and \code{content} (character string).
+#' @param n_predict Maximum tokens to generate (default: 256)
+#' @param temperature Sampling temperature (default: 0.7)
+#' @param top_p Nucleus sampling threshold (default: 0.95)
+#' @return Character string containing only the assistant's response text.
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' # Simple chat
+#' answer <- edge_chat_completion(ctx, list(
+#'   list(role = "user", content = "What is R?")
+#' ))
+#' cat(answer)
+#'
+#' # Multi-turn with system prompt
+#' answer <- edge_chat_completion(ctx, list(
+#'   list(role = "system", content = "You are a helpful R tutor."),
+#'   list(role = "user", content = "What is a data.frame?"),
+#'   list(role = "assistant", content = "A data.frame is a table..."),
+#'   list(role = "user", content = "How do I filter rows?")
+#' ))
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_chat_completion <- function(ctx, messages, n_predict = 256L,
+                                  temperature = 0.7, top_p = 0.95) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  if (!is.list(messages) || length(messages) == 0L) {
+    stop("messages must be a non-empty list of message objects with $role and $content")
+  }
+
+  # Format prompt using model's native chat template
+  prompt <- build_chat_prompt(messages, ctx = ctx)
+
+  n_predict <- max(1L, min(as.integer(n_predict), 4096L))
+  temperature <- max(0.0, min(temperature, 2.0))
+  top_p <- max(0.1, min(top_p, 1.0))
+
+  edge_completion_internal(ctx, prompt,
+                            as.integer(n_predict),
+                            as.numeric(temperature),
+                            as.numeric(top_p))
 }
 
 #' Clean up cache directory and manage storage
@@ -1953,3 +2074,1570 @@ edge_find_gguf_models <- function(source_dirs = NULL, target_dir = NULL, create_
   ))
 }
 
+
+# ── CUDA / GPU backend support ─────────────────────────────────────────────────
+
+#' Return the default path for the installed CUDA backend DLL
+#' @keywords internal
+edge_cuda_default_path <- function() {
+  cuda_dir <- file.path(tools::R_user_dir("edgemodelr", "cache"), "cuda")
+  if (!dir.exists(cuda_dir)) return(NULL)
+  if (.Platform$OS.type == "windows") {
+    dlls <- list.files(cuda_dir, pattern = "^ggml-cuda.*\\.dll$", full.names = TRUE)
+  } else {
+    dlls <- list.files(cuda_dir, pattern = "^(lib)?ggml-cuda.*\\.so(\\..*)?$", full.names = TRUE)
+  }
+  if (length(dlls) > 0) dlls[which.max(file.info(dlls)$mtime)] else NULL
+}
+
+#' Install the CUDA backend for GPU-accelerated inference
+#'
+#' Downloads a pre-built GGML CUDA backend shared library and stores it in the
+#' edgemodelr cache. After installation, restart your R session (or call
+#' `edge_reload_cuda()`) so the GPU backend is picked up during model loading.
+#'
+#' @param cuda_version CUDA version string. One of `"12.4"` or `"13.1"` (default).
+#'   Use `"13.1"` for Blackwell GPUs (RTX 50 series, GeForce sm_120).
+#' @param force Re-download even if already installed.
+#' @param llama_build llama.cpp build number to pull the backend from
+#'   (default: `"b8179"`, the version bundled in this package).
+#' @return Invisibly returns the path to the installed CUDA backend DLL.
+#' @examples
+#' \dontrun{
+#' edge_install_cuda()                  # GPU inference enabled after restart
+#' ctx <- edge_load_model("model.gguf", n_gpu_layers = 35)
+#' }
+#' @export
+edge_install_cuda <- function(cuda_version = "13.1",
+                              force = FALSE,
+                              llama_build = "b8179") {
+  if (!.Platform$OS.type == "windows") {
+    stop("edge_install_cuda() currently supports Windows only. ",
+         "On Linux/macOS, build with EDGEMODELR_CUDA=1 at install time.")
+  }
+
+  cuda_dir <- file.path(tools::R_user_dir("edgemodelr", "cache"), "cuda")
+  dir.create(cuda_dir, recursive = TRUE, showWarnings = FALSE)
+
+  dll_name <- sprintf("ggml-cuda-%s.dll", cuda_version)
+  dest <- file.path(cuda_dir, dll_name)
+
+  if (file.exists(dest) && !force) {
+    message("CUDA backend already installed at:\n  ", dest)
+    message("Use force = TRUE to re-download.")
+    invisible(edge_activate_cuda(dest))
+    return(invisible(dest))
+  }
+
+  # Download from llama.cpp GitHub Releases
+  zip_name <- sprintf("llama-%s-bin-win-cuda-%s-x64.zip", llama_build, cuda_version)
+  release_url <- sprintf(
+    "https://github.com/ggml-org/llama.cpp/releases/download/%s/%s",
+    llama_build, zip_name
+  )
+
+  tmp_zip <- tempfile(fileext = ".zip")
+  on.exit(unlink(tmp_zip), add = TRUE)
+
+  message("Downloading llama.cpp CUDA backend (", cuda_version, ") from GitHub Releases...")
+  message("This is a ~200MB download. Please wait...")
+
+  tryCatch({
+    utils::download.file(release_url, tmp_zip, mode = "wb", quiet = FALSE)
+  }, error = function(e) {
+    stop("Failed to download CUDA backend: ", conditionMessage(e),
+         "\nURL: ", release_url)
+  })
+
+  # Extract ggml-cuda*.dll plus ggml shared libraries it depends on
+  message("Extracting CUDA backend DLL and dependencies...")
+  zip_contents <- utils::unzip(tmp_zip, list = TRUE)
+  all_dlls <- zip_contents$Name[grepl("[.]dll$", zip_contents$Name)]
+
+  cuda_dlls <- all_dlls[grepl("ggml-cuda", all_dlls, fixed = TRUE)]
+  if (length(cuda_dlls) == 0) {
+    stop("Could not find ggml-cuda DLL in the downloaded archive.\n",
+         "Contents: ", paste(head(zip_contents$Name, 20), collapse = ", "))
+  }
+
+  # Extract the best match (prefer exact ggml-cuda-{version}.dll)
+  best <- cuda_dlls[grepl(sprintf("ggml-cuda-%s", cuda_version), cuda_dlls)]
+  if (length(best) == 0) best <- cuda_dlls[1]
+
+  # Also extract ggml shared runtime DLLs that ggml-cuda.dll links against
+  # (ggml-base.dll and ggml.dll from the same release are required dependencies)
+  companion_dlls <- all_dlls[grepl("^(ggml-base|ggml)[.]dll$", basename(all_dlls))]
+  to_extract <- unique(c(best[1], companion_dlls))
+  utils::unzip(tmp_zip, files = to_extract, exdir = cuda_dir, junkpaths = TRUE)
+  if (length(companion_dlls) > 0) {
+    message("Also extracted companion DLLs: ",
+            paste(basename(companion_dlls), collapse = ", "))
+  }
+
+  # Rename ggml-cuda to our canonical versioned name if needed
+  extracted <- file.path(cuda_dir, basename(best[1]))
+  if (!identical(extracted, dest)) {
+    file.rename(extracted, dest)
+  }
+
+  message("CUDA backend installed at:\n  ", dest)
+  message("\nTo activate GPU support, restart your R session or call:")
+  message("  edge_reload_cuda()")
+
+  edge_activate_cuda(dest)
+  invisible(dest)
+}
+
+#' Install CUDA runtime libraries required for GPU inference
+#'
+#' The CUDA backend (`ggml-cuda-XX.dll`) requires two sets of runtime DLLs
+#' that are **not** included with the NVIDIA display driver:
+#' \itemize{
+#'   \item \strong{nvcudart_hybrid64.dll} — CUDA hybrid runtime, already
+#'         present on your system in the Windows DriverStore (installed with
+#'         the GPU driver). This function copies it to the edgemodelr cache.
+#'   \item \strong{cublas64_13.dll / cublasLt64_13.dll} — cuBLAS linear-algebra
+#'         library (~400 MB download from NVIDIA's official redistrib server).
+#' }
+#'
+#' After running this function, call \code{edge_reload_cuda()} and load a model
+#' with \code{n_gpu_layers = -1} to run on your GPU.
+#'
+#' @param cuda_version CUDA major version string, e.g. \code{"13.1"} (default).
+#'   Must match the version used with \code{\link{edge_install_cuda}()}.
+#' @param force Reinstall even if the runtime DLLs are already present.
+#' @return Invisibly returns the cuda cache directory path.
+#' @seealso \code{\link{edge_install_cuda}}, \code{\link{edge_reload_cuda}}
+#' @examples
+#' \dontrun{
+#' edge_install_cuda()          # install ggml-cuda GPU backend DLL (~140 MB)
+#' edge_install_cuda_toolkit()  # install CUDA runtime DLLs (~400 MB, one-time)
+#' edge_reload_cuda()           # activate in this R session
+#' ctx <- edge_load_model("model.gguf", n_gpu_layers = -1)
+#' result <- edge_completion(ctx, "Hello", n_predict = 20)
+#' }
+#' @export
+edge_install_cuda_toolkit <- function(cuda_version = "13.1", force = FALSE) {
+  if (.Platform$OS.type != "windows") {
+    stop("edge_install_cuda_toolkit() is only needed on Windows. ",
+         "On Linux/macOS, install the CUDA Toolkit via your package manager.")
+  }
+
+  cuda_dir <- file.path(tools::R_user_dir("edgemodelr", "cache"), "cuda")
+  dir.create(cuda_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Check if already installed
+  cublas_present <- length(list.files(cuda_dir, pattern = "^cublas64.*\\.dll$",
+                                      ignore.case = TRUE)) > 0
+  cudart_present <- length(list.files(cuda_dir, pattern = "^nvcudart_hybrid64\\.dll$",
+                                      ignore.case = TRUE)) > 0
+  if (!force && cublas_present && cudart_present) {
+    message("CUDA runtime already installed in:\n  ", cuda_dir)
+    message("Use force = TRUE to reinstall.")
+    return(invisible(cuda_dir))
+  }
+
+  # --- Step 1: nvcudart_hybrid64.dll from Windows DriverStore (no download) ---
+  if (force || !cudart_present) {
+    driver_store <- file.path(Sys.getenv("SystemRoot", "C:\\Windows"),
+                              "System32", "DriverStore", "FileRepository")
+    hybrid_dlls <- list.files(driver_store, pattern = "^nvcudart_hybrid64\\.dll$",
+                               recursive = TRUE, full.names = TRUE)
+    if (length(hybrid_dlls) > 0) {
+      dest <- file.path(cuda_dir, "nvcudart_hybrid64.dll")
+      file.copy(hybrid_dlls[1], dest, overwrite = TRUE)
+      message("Copied nvcudart_hybrid64.dll from Windows DriverStore.")
+    } else {
+      message("Note: nvcudart_hybrid64.dll not found in DriverStore (unexpected).")
+      message("      It is normally installed with the NVIDIA GPU driver.")
+    }
+  }
+
+  # --- Step 2: cublas64_13.dll from NVIDIA redistrib (~400 MB) ---
+  if (force || !cublas_present) {
+    major_minor <- paste(strsplit(cuda_version, "\\.")[[1]][1:2], collapse = ".")
+    redistrib_base <- "https://developer.download.nvidia.com/compute/cuda/redist"
+    manifest_url   <- sprintf("%s/redistrib_%s.0.json", redistrib_base, major_minor)
+
+    message("Fetching NVIDIA redistrib manifest for CUDA ", cuda_version, "...")
+    manifest_text <- tryCatch({
+      con <- url(manifest_url)
+      on.exit(close(con), add = TRUE)
+      paste(readLines(con, warn = FALSE), collapse = "\n")
+    }, error = function(e) {
+      stop("Could not fetch NVIDIA redistrib manifest for CUDA ", cuda_version,
+           ".\nURL: ", manifest_url,
+           "\nMake sure you are connected to the internet and CUDA ",
+           cuda_version, " is publicly released.")
+    })
+
+    # Extract relative_path for libcublas/windows-x86_64
+    pattern <- '"relative_path":\\s*"(libcublas/windows-x86_64/[^"]+\\.zip)"'
+    m <- regmatches(manifest_text, regexpr(pattern, manifest_text, perl = TRUE))
+    if (length(m) == 0) {
+      stop("Could not find libcublas/windows-x86_64 in the CUDA ", cuda_version,
+           " redistrib manifest.")
+    }
+    rel_path <- sub(pattern, "\\1", m, perl = TRUE)
+    cublas_url <- paste0(redistrib_base, "/", rel_path)
+
+    tmp_zip <- tempfile(fileext = ".zip")
+    on.exit(unlink(tmp_zip), add = TRUE)
+
+    message("Downloading cuBLAS for CUDA ", cuda_version, "...")
+    message("URL: ", cublas_url)
+    message("(This is a ~400 MB one-time download. Please wait...)")
+    old_timeout <- getOption("timeout")
+    options(timeout = 3600)   # 1-hour cap for large files
+    on.exit(options(timeout = old_timeout), add = TRUE)
+    tryCatch({
+      utils::download.file(cublas_url, tmp_zip, mode = "wb", quiet = FALSE)
+    }, error = function(e) {
+      stop("Download failed: ", conditionMessage(e))
+    })
+
+    # Extract only cublas64_XX.dll and cublasLt64_XX.dll
+    zip_contents <- utils::unzip(tmp_zip, list = TRUE)
+    cublas_dlls  <- zip_contents$Name[
+      grepl("^(cublas64|cublasLt64).*\\.dll$", basename(zip_contents$Name),
+            ignore.case = TRUE)
+    ]
+    if (length(cublas_dlls) == 0) {
+      stop("No cublas DLLs found in the downloaded archive.")
+    }
+    message("Extracting cuBLAS DLLs...")
+    utils::unzip(tmp_zip, files = cublas_dlls, exdir = cuda_dir, junkpaths = TRUE)
+    message("Installed: ", paste(basename(cublas_dlls), collapse = ", "))
+  }
+
+  installed <- list.files(cuda_dir, pattern = "\\.(dll|DLL)$", full.names = FALSE)
+  message("\nAll files in cuda dir:\n", paste0("  ", installed, collapse = "\n"))
+  message("\nDone! Call edge_reload_cuda() to activate GPU inference.")
+
+  invisible(cuda_dir)
+}
+
+#' Activate an installed CUDA backend without restarting R
+#'
+#' This loads the CUDA backend DLL into the current session. It must be called
+#' before the first `edge_load_model()` call in the session, otherwise a session
+#' restart is required.
+#'
+#' @param path Path to the CUDA DLL. Defaults to the standard install location.
+#' @return Invisibly returns `TRUE` if activation succeeded.
+#' @export
+edge_reload_cuda <- function(path = NULL) {
+  if (is.null(path)) {
+    path <- edge_cuda_default_path()
+    if (is.null(path)) {
+      stop("No CUDA backend found. Run edge_install_cuda() first.")
+    }
+  }
+  edge_activate_cuda(path)
+}
+
+#' @keywords internal
+edge_activate_cuda <- function(path) {
+  if (!file.exists(path)) {
+    warning("CUDA backend not found at: ", path)
+    return(invisible(FALSE))
+  }
+  # Add the cuda directory to PATH so Windows DLL loader can find cudart/cublas
+  # dependencies when ggml-cuda-XX.dll is loaded.
+  cuda_dir <- normalizePath(dirname(path), winslash = "\\", mustWork = FALSE)
+  current_path <- Sys.getenv("PATH")
+  if (!grepl(cuda_dir, current_path, fixed = TRUE)) {
+    path_sep <- if (.Platform$OS.type == "windows") ";" else ":"
+    Sys.setenv(PATH = paste(cuda_dir, current_path, sep = path_sep))
+  }
+  ok <- edge_use_cuda_backend_internal(path)
+  if (ok) {
+    message("CUDA backend registered: ", path)
+    message("GPU layers will be used when n_gpu_layers > 0 in edge_load_model().")
+  }
+  invisible(ok)
+}
+
+#' Check whether a CUDA backend is installed and active
+#'
+#' @return A list with `installed` (logical), `active` (logical), and `path`
+#'   (character or NA).
+#' @export
+edge_cuda_info <- function() {
+  installed_path <- edge_cuda_default_path()
+  active_path    <- edge_cuda_backend_path_internal()
+  backend_loaded <- edge_cuda_backend_loaded_internal()
+
+  list(
+    installed = !is.null(installed_path),
+    active    = backend_loaded,
+    path      = if (nchar(active_path) > 0) active_path
+                else if (!is.null(installed_path)) installed_path
+                else NA_character_
+  )
+}
+
+# ============================================================================
+# Structured Output / Grammar-Constrained Generation
+# ============================================================================
+
+#' Generate text constrained by a GBNF grammar
+#'
+#' Uses llama.cpp's grammar-constrained sampling to force output to conform
+#' to a GBNF grammar specification. This ensures structured, parseable output.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param prompt The input prompt
+#' @param grammar A GBNF grammar string defining allowed output structure
+#' @param grammar_root The root rule name in the grammar (default: "root")
+#' @param n_predict Maximum tokens to generate (default: 512)
+#' @param temperature Sampling temperature (default: 0.3, lower for structured output)
+#' @param top_p Nucleus sampling threshold (default: 0.95)
+#' @return Character string containing only the generated text (not the prompt)
+#'
+#' @details
+#' GBNF (GGML BNF) is a format for defining formal grammars that constrain
+#' model output. This is useful for generating JSON, XML, or any structured format.
+#'
+#' Common GBNF patterns:
+#' \itemize{
+#'   \item JSON object: Use \code{edge_json_grammar()} for convenience
+#'   \item Enum/choices: \code{'root ::= "yes" | "no" | "maybe"'}
+#'   \item Number: \code{'root ::= [0-9]+'}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' # Force yes/no output
+#' grammar <- 'root ::= "yes" | "no"'
+#' result <- edge_grammar_completion(ctx, "Is the sky blue? Answer:", grammar)
+#'
+#' # Force JSON output
+#' json_grammar <- edge_json_grammar(list(
+#'   sentiment = c("positive", "negative", "neutral"),
+#'   confidence = "number"
+#' ))
+#' result <- edge_grammar_completion(ctx,
+#'   "Analyze sentiment: 'I love this product'\nJSON:",
+#'   json_grammar)
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_grammar_completion <- function(ctx, prompt, grammar, grammar_root = "root",
+                                     n_predict = 512L, temperature = 0.3, top_p = 0.95) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  if (!is.character(prompt) || length(prompt) != 1L) {
+    stop("Prompt must be a single character string")
+  }
+  if (!is.character(grammar) || length(grammar) != 1L || nchar(grammar) == 0L) {
+    stop("grammar must be a non-empty character string containing a GBNF grammar")
+  }
+
+  n_predict <- max(1L, min(as.integer(n_predict), 4096L))
+  temperature <- max(0.0, min(temperature, 2.0))
+  top_p <- max(0.1, min(top_p, 1.0))
+
+  edge_completion_grammar_internal(
+    ctx, prompt, grammar, grammar_root,
+    as.integer(n_predict), as.numeric(temperature), as.numeric(top_p)
+  )
+}
+
+#' Generate a GBNF grammar for JSON output from a schema
+#'
+#' Converts a simple R list schema into a GBNF grammar string that constrains
+#' model output to valid JSON matching the schema.
+#'
+#' @param schema A named list where each element defines a field. Values can be:
+#'   \itemize{
+#'     \item \code{"string"} - any string value
+#'     \item \code{"number"} - a numeric value (integer or decimal)
+#'     \item \code{"integer"} - an integer value
+#'     \item \code{"boolean"} - true or false
+#'     \item A character vector - enum of allowed values (e.g., \code{c("positive", "negative")})
+#'   }
+#' @return A GBNF grammar string
+#'
+#' @examples
+#' \dontrun{
+#' # Schema with enum and free-text fields
+#' grammar <- edge_json_grammar(list(
+#'   sentiment = c("positive", "negative", "neutral"),
+#'   confidence = "number",
+#'   explanation = "string"
+#' ))
+#' cat(grammar)
+#'
+#' # Use with edge_grammar_completion
+#' ctx <- edge_load_model("model.gguf")
+#' result <- edge_grammar_completion(ctx,
+#'   "Analyze: 'Great product!'\nJSON:", grammar)
+#' parsed <- jsonlite::fromJSON(result)
+#' }
+#' @export
+edge_json_grammar <- function(schema) {
+  if (!is.list(schema) || is.null(names(schema))) {
+    stop("schema must be a named list")
+  }
+
+  ws <- 'ws ::= [ \\t\\n]*\n'
+  string_rule <- 'string ::= "\\"" [^"\\\\]* "\\""\n'
+  number_rule <- 'number ::= "-"? [0-9]+ ("." [0-9]+)?\n'
+  integer_rule <- 'integer ::= "-"? [0-9]+\n'
+  boolean_rule <- 'boolean ::= "true" | "false"\n'
+
+  field_rules <- character()
+  field_names_grammar <- character()
+  needed_rules <- character()
+
+  for (i in seq_along(schema)) {
+    field_name <- names(schema)[i]
+    field_spec <- schema[[i]]
+    rule_name <- paste0("field-", i)
+
+    if (is.character(field_spec) && length(field_spec) == 1L) {
+      # Type specifier
+      type <- tolower(field_spec)
+      if (type == "string") {
+        field_rules <- c(field_rules,
+          paste0(rule_name, ' ::= string'))
+        needed_rules <- c(needed_rules, "string")
+      } else if (type == "number") {
+        field_rules <- c(field_rules,
+          paste0(rule_name, ' ::= number'))
+        needed_rules <- c(needed_rules, "number")
+      } else if (type == "integer") {
+        field_rules <- c(field_rules,
+          paste0(rule_name, ' ::= integer'))
+        needed_rules <- c(needed_rules, "integer")
+      } else if (type == "boolean") {
+        field_rules <- c(field_rules,
+          paste0(rule_name, ' ::= boolean'))
+        needed_rules <- c(needed_rules, "boolean")
+      } else {
+        stop("Unknown type '", type, "' for field '", field_name,
+             "'. Use 'string', 'number', 'integer', 'boolean', or a character vector for enum.")
+      }
+    } else if (is.character(field_spec) && length(field_spec) > 1L) {
+      # Enum values
+      enum_options <- paste0('"\\\"', field_spec, '\\\""', collapse = " | ")
+      field_rules <- c(field_rules,
+        paste0(rule_name, ' ::= ', enum_options))
+    } else {
+      stop("Invalid schema for field '", field_name,
+           "'. Use a string type name or character vector for enum.")
+    }
+
+    # Build the field grammar entry: "key": value
+    field_entry <- paste0('"\\"', field_name, '\\"" ws ":" ws ', rule_name)
+    field_names_grammar <- c(field_names_grammar, field_entry)
+  }
+
+  # Build root rule with comma-separated fields
+  if (length(field_names_grammar) == 1L) {
+    fields_combined <- field_names_grammar
+  } else {
+    fields_combined <- paste(field_names_grammar, collapse = ' ws "," ws ')
+  }
+
+  root_rule <- paste0('root ::= "{" ws ', fields_combined, ' ws "}"\n')
+
+  # Assemble grammar
+  grammar_parts <- root_rule
+  grammar_parts <- c(grammar_parts, paste0(field_rules, "\n"))
+  grammar_parts <- c(grammar_parts, ws)
+  if ("string" %in% needed_rules) grammar_parts <- c(grammar_parts, string_rule)
+  if ("number" %in% needed_rules) grammar_parts <- c(grammar_parts, number_rule)
+  if ("integer" %in% needed_rules) grammar_parts <- c(grammar_parts, integer_rule)
+  if ("boolean" %in% needed_rules) grammar_parts <- c(grammar_parts, boolean_rule)
+
+  paste(grammar_parts, collapse = "")
+}
+
+#' Extract structured data from text using grammar-constrained generation
+#'
+#' High-level function that combines prompt construction with grammar-constrained
+#' generation to extract structured data from text. Returns a parsed R list.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param text The input text to analyze
+#' @param schema A named list defining the extraction schema (see \code{\link{edge_json_grammar}})
+#' @param instruction Optional instruction to guide extraction (default: auto-generated)
+#' @param n_predict Maximum tokens to generate (default: 512)
+#' @param temperature Sampling temperature (default: 0.2, very low for factual extraction)
+#' @return A named list with the extracted fields, or the raw JSON string if parsing fails
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' result <- edge_extract(ctx,
+#'   "I absolutely love this product! Best purchase ever.",
+#'   schema = list(
+#'     sentiment = c("positive", "negative", "neutral"),
+#'     confidence = "number"
+#'   ))
+#' # result$sentiment == "positive"
+#' # result$confidence == 0.95
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_extract <- function(ctx, text, schema, instruction = NULL, n_predict = 512L,
+                          temperature = 0.2) {
+  if (!is.character(text) || length(text) != 1L) {
+    stop("text must be a single character string")
+  }
+
+  grammar <- edge_json_grammar(schema)
+  field_descriptions <- vapply(seq_along(schema), function(i) {
+    nm <- names(schema)[i]
+    spec <- schema[[i]]
+    if (is.character(spec) && length(spec) > 1L) {
+      paste0(nm, " (one of: ", paste(spec, collapse = ", "), ")")
+    } else {
+      paste0(nm, " (", spec, ")")
+    }
+  }, character(1))
+
+  if (is.null(instruction)) {
+    instruction <- paste0(
+      "Extract the following fields from the text: ",
+      paste(field_descriptions, collapse = ", "), "."
+    )
+  }
+
+  prompt <- paste0(
+    "### Instruction\n", instruction,
+    "\n\n### Text\n", text,
+    "\n\n### Response\n"
+  )
+
+  raw_output <- edge_grammar_completion(ctx, prompt, grammar,
+                                         n_predict = n_predict,
+                                         temperature = temperature)
+
+  # Try to parse JSON
+  tryCatch({
+    # Find JSON object in output
+    json_start <- regexpr("\\{", raw_output)
+    if (json_start > 0) {
+      json_str <- substring(raw_output, json_start)
+      # Find matching closing brace
+      depth <- 0
+      for (i in seq_len(nchar(json_str))) {
+        ch <- substr(json_str, i, i)
+        if (ch == "{") depth <- depth + 1
+        else if (ch == "}") {
+          depth <- depth - 1
+          if (depth == 0) {
+            json_str <- substr(json_str, 1, i)
+            break
+          }
+        }
+      }
+
+      if (requireNamespace("jsonlite", quietly = TRUE)) {
+        return(jsonlite::fromJSON(json_str))
+      } else {
+        # Basic parsing fallback without jsonlite
+        return(json_str)
+      }
+    }
+    raw_output
+  }, error = function(e) {
+    warning("JSON parsing failed, returning raw output: ", e$message)
+    raw_output
+  })
+}
+
+#' Classify text into predefined categories
+#'
+#' Convenience function that uses grammar-constrained generation to classify
+#' text into one of the provided categories.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param text Text to classify (character string or vector for batch)
+#' @param categories Character vector of allowed categories
+#' @param instruction Optional classification instruction
+#' @param temperature Sampling temperature (default: 0.1)
+#' @return Character string (single text) or character vector (batch) with the predicted category
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' # Single classification
+#' result <- edge_classify(ctx,
+#'   "I love this product!",
+#'   categories = c("positive", "negative", "neutral"))
+#'
+#' # Batch classification
+#' texts <- c("Great product!", "Terrible experience", "It was okay")
+#' results <- edge_classify(ctx, texts,
+#'   categories = c("positive", "negative", "neutral"))
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_classify <- function(ctx, text, categories, instruction = NULL,
+                           temperature = 0.1) {
+  if (!is.character(categories) || length(categories) < 2L) {
+    stop("categories must be a character vector with at least 2 options")
+  }
+
+  # Build grammar that only allows one of the categories
+  enum_options <- paste0('"', categories, '"', collapse = " | ")
+  grammar <- paste0('root ::= ', enum_options, '\n')
+
+  if (is.null(instruction)) {
+    instruction <- paste0(
+      "Classify the following text into exactly one of these categories: ",
+      paste(categories, collapse = ", "), ".\n",
+      "Respond with only the category name, nothing else."
+    )
+  }
+
+  # Handle batch
+  classify_one <- function(single_text) {
+    prompt <- paste0(
+      "### Instruction\n", instruction,
+      "\n\n### Text\n", single_text,
+      "\n\n### Category\n"
+    )
+
+    # Try grammar-constrained first, fall back to free generation + matching
+    result <- tryCatch({
+      out <- edge_grammar_completion(ctx, prompt, grammar,
+                                      n_predict = 50L,
+                                      temperature = temperature)
+      trimws(out)
+    }, error = function(e) {
+      # Grammar sampler can fail on some models/tokenizers; fall back
+      raw <- edge_completion_internal(ctx, prompt, 50L, temperature, 0.95)
+      if (startsWith(raw, prompt)) raw <- substring(raw, nchar(prompt) + 1L)
+      raw <- trimws(raw)
+      # Match to closest category
+      raw_lower <- tolower(raw)
+      for (cat in categories) {
+        if (grepl(tolower(cat), raw_lower, fixed = TRUE)) return(cat)
+      }
+      # If no match, return first word and hope it matches
+      first_word <- sub("\\s.*", "", raw)
+      for (cat in categories) {
+        if (startsWith(tolower(cat), tolower(first_word))) return(cat)
+      }
+      categories[1]  # last resort
+    })
+    result
+  }
+
+  if (length(text) == 1L) {
+    classify_one(text)
+  } else {
+    vapply(text, classify_one, character(1), USE.NAMES = FALSE)
+  }
+}
+
+
+# ============================================================================
+# Embeddings API
+# ============================================================================
+
+#' Extract text embeddings from a model
+#'
+#' Computes dense vector embeddings for one or more text inputs using the
+#' loaded model. These embeddings can be used for semantic search, clustering,
+#' similarity comparison, and as input to downstream models.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param texts Character vector of texts to embed
+#' @param normalize Whether to L2-normalize the embeddings (default: TRUE).
+#'   Normalized embeddings allow cosine similarity to be computed as a simple dot product.
+#' @return A numeric matrix with dimensions (n_texts x n_embd), where each row
+#'   is the embedding vector for the corresponding input text.
+#'
+#' @details
+#' For best results, use a model designed for embeddings (e.g., nomic-embed-text).
+#' However, generative models can also produce useful embeddings from their
+#' hidden states.
+#'
+#' The embedding dimension depends on the model architecture (e.g., 768 for
+#' small models, 4096+ for larger ones). Use \code{edge_model_n_embd()} to
+#' query the dimension.
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("nomic-embed-text.gguf")
+#'
+#' # Single embedding
+#' emb <- edge_embeddings(ctx, "The cat sat on the mat")
+#' dim(emb)  # 1 x n_embd
+#'
+#' # Multiple embeddings
+#' texts <- c("cats are great", "dogs are loyal", "the stock market crashed")
+#' embs <- edge_embeddings(ctx, texts)
+#' dim(embs)  # 3 x n_embd
+#'
+#' # Compute similarity
+#' edge_similarity(embs[1,], embs[2,])  # high (both about pets)
+#' edge_similarity(embs[1,], embs[3,])  # low (different topics)
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_embeddings <- function(ctx, texts, normalize = TRUE) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  if (!is.character(texts) || length(texts) == 0L) {
+    stop("texts must be a non-empty character vector")
+  }
+  if (any(is.na(texts))) {
+    stop("texts must not contain NA values")
+  }
+
+  result <- edge_embeddings_internal(ctx, texts, as.logical(normalize))
+
+  # Check if we got all zeros (indicates model wasn't loaded with embeddings=TRUE)
+  if (all(result == 0)) {
+    warning("All embeddings are zero. The model must be loaded with embeddings=TRUE:\n",
+            "  ctx <- edge_load_model('model.gguf', embeddings = TRUE)\n",
+            "Returning zero matrix.")
+  }
+
+  result
+}
+
+#' Compute cosine similarity between two embedding vectors
+#'
+#' @param a Numeric vector (embedding)
+#' @param b Numeric vector (embedding)
+#' @return Cosine similarity score between -1 and 1
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#' embs <- edge_embeddings(ctx, c("happy cat", "joyful kitten", "stock market"))
+#'
+#' edge_similarity(embs[1,], embs[2,])  # ~0.9 (similar meaning)
+#' edge_similarity(embs[1,], embs[3,])  # ~0.1 (different topics)
+#' }
+#' @export
+edge_similarity <- function(a, b) {
+  if (!is.numeric(a) || !is.numeric(b)) {
+    stop("Both a and b must be numeric vectors")
+  }
+  if (length(a) != length(b)) {
+    stop("Vectors must have the same length")
+  }
+  dot <- sum(a * b)
+  norm_a <- sqrt(sum(a * a))
+  norm_b <- sqrt(sum(b * b))
+  if (norm_a == 0 || norm_b == 0) return(0)
+  dot / (norm_a * norm_b)
+}
+
+#' Get the embedding dimension of a loaded model
+#'
+#' @param ctx Model context from edge_load_model()
+#' @return Integer giving the embedding vector dimension
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#' edge_model_n_embd(ctx)  # e.g., 4096
+#' }
+#' @export
+edge_model_n_embd <- function(ctx) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  edge_model_n_embd_internal(ctx)
+}
+
+#' Compute a similarity matrix for a set of embeddings
+#'
+#' @param embeddings A numeric matrix where each row is an embedding vector
+#'   (as returned by \code{\link{edge_embeddings}})
+#' @return A symmetric numeric matrix of pairwise cosine similarities
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#' embs <- edge_embeddings(ctx, c("cat", "kitten", "car", "automobile"))
+#' sim_mat <- edge_similarity_matrix(embs)
+#' # sim_mat[1,2] high (cat~kitten), sim_mat[1,3] low (cat~car)
+#' }
+#' @export
+edge_similarity_matrix <- function(embeddings) {
+  if (!is.matrix(embeddings) || !is.numeric(embeddings)) {
+    stop("embeddings must be a numeric matrix")
+  }
+  n <- nrow(embeddings)
+  # Normalize rows
+  norms <- sqrt(rowSums(embeddings^2))
+  norms[norms == 0] <- 1  # avoid division by zero
+  normed <- embeddings / norms
+  # Cosine similarity = dot product of normalized vectors
+  tcrossprod(normed)
+}
+
+
+# ============================================================================
+# Batch Processing / Vectorized API
+# ============================================================================
+
+#' Apply a prompt template to a vector of texts
+#'
+#' Maps a prompt template over a character vector, generating completions for
+#' each element. This is the primary function for batch LLM operations on data
+#' frames. A progress indicator is printed to the console.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param texts Character vector of input texts
+#' @param prompt_template A string with \code{\{text\}} as a placeholder for each input,
+#'   or a function that takes a single text and returns a prompt string.
+#' @param n_predict Maximum tokens to generate per text (default: 128)
+#' @param temperature Sampling temperature (default: 0.7)
+#' @param top_p Nucleus sampling threshold (default: 0.95)
+#' @param grammar Optional GBNF grammar string to constrain output
+#' @param progress Show progress messages (default: TRUE)
+#' @return Character vector of completions, same length as \code{texts}
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' # Summarize a column
+#' df <- data.frame(review = c("Great product!", "Terrible, broke on day 1"))
+#' df$summary <- edge_map(ctx, df$review,
+#'   "Summarize in 5 words: {text}")
+#'
+#' # With a custom prompt function
+#' df$analysis <- edge_map(ctx, df$review, function(text) {
+#'   paste0("Product review: ", text, "\nOne-word sentiment:")
+#' })
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_map <- function(ctx, texts, prompt_template, n_predict = 128L,
+                      temperature = 0.7, top_p = 0.95, grammar = NULL,
+                      progress = TRUE) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  if (!is.character(texts) || length(texts) == 0L) {
+    stop("texts must be a non-empty character vector")
+  }
+
+  n <- length(texts)
+  results <- character(n)
+
+  build_prompt <- if (is.function(prompt_template)) {
+    prompt_template
+  } else if (is.character(prompt_template) && length(prompt_template) == 1L) {
+    function(text) gsub("{text}", text, prompt_template, fixed = TRUE)
+  } else {
+    stop("prompt_template must be a string with {text} placeholder or a function")
+  }
+
+  use_grammar <- !is.null(grammar) && nchar(grammar) > 0L
+
+  for (i in seq_len(n)) {
+    if (progress && n > 1L) {
+      message(sprintf("[%d/%d] Processing...", i, n))
+      flush.console()
+    }
+
+    prompt <- build_prompt(texts[i])
+
+    if (use_grammar) {
+      results[i] <- edge_grammar_completion(ctx, prompt, grammar,
+                                             n_predict = n_predict,
+                                             temperature = temperature,
+                                             top_p = top_p)
+    } else {
+      raw <- edge_completion_internal(ctx, prompt,
+                                       as.integer(n_predict),
+                                       as.numeric(temperature),
+                                       as.numeric(top_p))
+      # Strip the prompt prefix from the result
+      if (startsWith(raw, prompt)) {
+        results[i] <- substring(raw, nchar(prompt) + 1L)
+      } else {
+        results[i] <- raw
+      }
+    }
+  }
+
+  if (progress && n > 1L) message(sprintf("Done. Processed %d texts.", n))
+  results
+}
+
+#' Extract structured data from multiple texts
+#'
+#' Batch version of \code{\link{edge_extract}} that processes a vector of texts
+#' and returns a data frame.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param texts Character vector of texts to process
+#' @param schema A named list defining the extraction schema (see \code{\link{edge_json_grammar}})
+#' @param instruction Optional instruction to guide extraction
+#' @param n_predict Maximum tokens to generate per text (default: 512)
+#' @param temperature Sampling temperature (default: 0.2)
+#' @param progress Show progress messages (default: TRUE)
+#' @return A data frame with one row per text and columns for each schema field
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' reviews <- c("Love it!", "Worst purchase ever", "It's okay I guess")
+#' results <- edge_extract_batch(ctx, reviews,
+#'   schema = list(
+#'     sentiment = c("positive", "negative", "neutral"),
+#'     confidence = "number"
+#'   ))
+#' # results is a data frame:
+#' #   sentiment confidence
+#' # 1  positive       0.95
+#' # 2  negative       0.90
+#' # 3   neutral       0.60
+#'
+#' edge_free_model(ctx)
+#' }
+#' @export
+edge_extract_batch <- function(ctx, texts, schema, instruction = NULL,
+                                n_predict = 512L, temperature = 0.2,
+                                progress = TRUE) {
+  if (!is.character(texts) || length(texts) == 0L) {
+    stop("texts must be a non-empty character vector")
+  }
+
+  n <- length(texts)
+  results_list <- vector("list", n)
+
+  for (i in seq_len(n)) {
+    if (progress && n > 1L) {
+      message(sprintf("[%d/%d] Extracting...", i, n))
+      flush.console()
+    }
+
+    result <- tryCatch(
+      edge_extract(ctx, texts[i], schema,
+                    instruction = instruction,
+                    n_predict = n_predict,
+                    temperature = temperature),
+      error = function(e) {
+        warning("Extraction failed for text ", i, ": ", e$message)
+        # Return NA-filled row
+        stats::setNames(as.list(rep(NA, length(schema))), names(schema))
+      }
+    )
+
+    if (is.character(result) && length(result) == 1L) {
+      # JSON parsing failed, return NA row
+      results_list[[i]] <- stats::setNames(as.list(rep(NA, length(schema))), names(schema))
+    } else {
+      results_list[[i]] <- result
+    }
+  }
+
+  if (progress && n > 1L) message(sprintf("Done. Extracted from %d texts.", n))
+
+  # Combine into data frame
+  tryCatch(
+    do.call(rbind.data.frame, c(results_list, stringsAsFactors = FALSE)),
+    error = function(e) {
+      # Fallback: build data frame manually
+      df <- data.frame(matrix(NA, nrow = n, ncol = length(schema)))
+      names(df) <- names(schema)
+      for (i in seq_len(n)) {
+        row <- results_list[[i]]
+        if (is.list(row)) {
+          for (nm in names(schema)) {
+            if (nm %in% names(row)) df[i, nm] <- row[[nm]]
+          }
+        }
+      }
+      df
+    }
+  )
+}
+
+
+# ============================================================================
+# RAG (Retrieval-Augmented Generation) Pipeline
+# ============================================================================
+
+#' Build an embedding index from text documents
+#'
+#' Reads text files from a directory (or accepts text directly), computes
+#' embeddings for chunks, and returns an index object for retrieval.
+#'
+#' @param source Either a directory path containing text files, or a character
+#'   vector of text chunks to index directly.
+#' @param ctx Model context from edge_load_model() (used for embedding)
+#' @param chunk_size Approximate number of characters per chunk (default: 500).
+#'   Ignored when \code{source} is a character vector.
+#' @param chunk_overlap Number of characters of overlap between chunks (default: 50).
+#'   Ignored when \code{source} is a character vector.
+#' @param file_pattern Glob pattern for files to read (default: "*.txt").
+#'   Also supports "*.md", "*.csv", etc.
+#' @param normalize Normalize embeddings (default: TRUE)
+#' @param progress Show progress messages (default: TRUE)
+#' @return An \code{edge_index} object (a list) containing:
+#'   \itemize{
+#'     \item \code{chunks}: character vector of text chunks
+#'     \item \code{embeddings}: numeric matrix (n_chunks x n_embd)
+#'     \item \code{sources}: character vector of source file paths (or NA for direct text)
+#'     \item \code{n_chunks}: number of chunks
+#'     \item \code{n_embd}: embedding dimension
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#'
+#' # Index a directory of text files
+#' index <- edge_index_documents("./reports/", ctx)
+#'
+#' # Or index text directly
+#' texts <- c("Revenue grew 15% in Q3", "New product launched in Asia")
+#' index <- edge_index_documents(texts, ctx)
+#'
+#' # Search the index
+#' results <- edge_search(index, ctx, "What happened with revenue?")
+#' }
+#' @export
+edge_index_documents <- function(source, ctx, chunk_size = 500L,
+                                  chunk_overlap = 50L,
+                                  file_pattern = "*.txt",
+                                  normalize = TRUE,
+                                  progress = TRUE) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+
+  chunks <- character()
+  sources <- character()
+
+  if (length(source) == 1L && dir.exists(source)) {
+    # Read files from directory
+    files <- list.files(source, pattern = utils::glob2rx(file_pattern),
+                        full.names = TRUE, recursive = TRUE)
+    if (length(files) == 0L) {
+      stop("No files matching '", file_pattern, "' found in: ", source)
+    }
+
+    if (progress) message(sprintf("Reading %d files...", length(files)))
+
+    for (filepath in files) {
+      text <- tryCatch(
+        paste(readLines(filepath, warn = FALSE), collapse = "\n"),
+        error = function(e) {
+          warning("Could not read: ", filepath)
+          NULL
+        }
+      )
+      if (is.null(text) || nchar(text) == 0L) next
+
+      file_chunks <- .chunk_text(text, chunk_size, chunk_overlap)
+      chunks <- c(chunks, file_chunks)
+      sources <- c(sources, rep(filepath, length(file_chunks)))
+    }
+  } else if (is.character(source) && length(source) > 0L) {
+    # Direct text input - optionally chunk long texts
+    for (i in seq_along(source)) {
+      if (nchar(source[i]) > chunk_size * 2L) {
+        text_chunks <- .chunk_text(source[i], chunk_size, chunk_overlap)
+        chunks <- c(chunks, text_chunks)
+        sources <- c(sources, rep(NA_character_, length(text_chunks)))
+      } else {
+        chunks <- c(chunks, source[i])
+        sources <- c(sources, NA_character_)
+      }
+    }
+  } else {
+    stop("source must be a directory path or a character vector of texts")
+  }
+
+  if (length(chunks) == 0L) {
+    stop("No text content found to index")
+  }
+
+  if (progress) message(sprintf("Computing embeddings for %d chunks...", length(chunks)))
+
+  # Compute embeddings in batches to avoid memory issues
+  batch_size <- 32L
+  n_chunks <- length(chunks)
+  emb_list <- list()
+
+  for (start in seq(1L, n_chunks, by = batch_size)) {
+    end <- min(start + batch_size - 1L, n_chunks)
+    batch_chunks <- chunks[start:end]
+
+    if (progress && n_chunks > batch_size) {
+      message(sprintf("  Embedding batch %d-%d of %d...", start, end, n_chunks))
+    }
+
+    emb_list[[length(emb_list) + 1L]] <- edge_embeddings(ctx, batch_chunks,
+                                                          normalize = normalize)
+  }
+
+  embeddings <- do.call(rbind, emb_list)
+
+  if (progress) message(sprintf("Index built: %d chunks, %d-dim embeddings",
+                                 n_chunks, ncol(embeddings)))
+
+  structure(
+    list(
+      chunks = chunks,
+      embeddings = embeddings,
+      sources = sources,
+      n_chunks = n_chunks,
+      n_embd = ncol(embeddings)
+    ),
+    class = "edge_index"
+  )
+}
+
+#' Search an embedding index for relevant chunks
+#'
+#' Finds the most similar text chunks to a query using cosine similarity.
+#'
+#' @param index An \code{edge_index} object from \code{\link{edge_index_documents}}
+#' @param ctx Model context (same model used to build the index)
+#' @param query Query text string
+#' @param top_k Number of results to return (default: 5)
+#' @return A data frame with columns:
+#'   \itemize{
+#'     \item \code{chunk}: the text content
+#'     \item \code{score}: cosine similarity to the query
+#'     \item \code{source}: source file path (or NA)
+#'     \item \code{index}: position in the original index
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#' index <- edge_index_documents("./docs/", ctx)
+#'
+#' results <- edge_search(index, ctx, "quarterly revenue growth")
+#' print(results)  # top 5 most relevant chunks
+#' }
+#' @export
+edge_search <- function(index, ctx, query, top_k = 5L) {
+  if (!inherits(index, "edge_index")) {
+    stop("index must be an edge_index object from edge_index_documents()")
+  }
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context")
+  }
+  if (!is.character(query) || length(query) != 1L) {
+    stop("query must be a single character string")
+  }
+
+  top_k <- min(as.integer(top_k), index$n_chunks)
+
+  # Embed the query
+  query_emb <- edge_embeddings(ctx, query, normalize = TRUE)
+
+  # Compute similarities: query_emb (1 x d) %*% t(index_emb) (d x n)
+  scores <- as.numeric(query_emb %*% t(index$embeddings))
+
+  # Get top-k indices
+  top_indices <- order(scores, decreasing = TRUE)[seq_len(top_k)]
+
+  data.frame(
+    chunk = index$chunks[top_indices],
+    score = scores[top_indices],
+    source = index$sources[top_indices],
+    index = top_indices,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Ask a question using retrieval-augmented generation
+#'
+#' Combines semantic search with text generation: retrieves relevant context
+#' from the index, then generates an answer grounded in that context.
+#'
+#' @param ctx Model context from edge_load_model()
+#' @param question The question to answer
+#' @param index An \code{edge_index} object from \code{\link{edge_index_documents}}
+#' @param top_k Number of context chunks to retrieve (default: 3)
+#' @param n_predict Maximum tokens for the answer (default: 256)
+#' @param temperature Sampling temperature (default: 0.3)
+#' @param system_prompt Optional system-level instruction for the model
+#' @param return_context If TRUE, return both answer and retrieved context (default: FALSE)
+#' @return If \code{return_context = FALSE}: a character string with the answer.
+#'   If \code{return_context = TRUE}: a list with \code{answer}, \code{context} (data frame
+#'   from \code{edge_search}), and \code{prompt} (the full constructed prompt).
+#'
+#' @examples
+#' \dontrun{
+#' ctx <- edge_load_model("model.gguf")
+#' index <- edge_index_documents("./reports/", ctx)
+#'
+#' # Simple Q&A
+#' answer <- edge_ask(ctx, "What were Q3 revenues?", index)
+#' cat(answer)
+#'
+#' # With context for debugging
+#' result <- edge_ask(ctx, "What were Q3 revenues?", index,
+#'                     return_context = TRUE)
+#' cat(result$answer)
+#' print(result$context)  # shows which chunks were used
+#' }
+#' @export
+edge_ask <- function(ctx, question, index, top_k = 3L, n_predict = 256L,
+                      temperature = 0.3, system_prompt = NULL,
+                      return_context = FALSE) {
+  if (!is_valid_model(ctx)) {
+    stop("Invalid model context. Load a model first with edge_load_model()")
+  }
+  if (!inherits(index, "edge_index")) {
+    stop("index must be an edge_index object from edge_index_documents()")
+  }
+  if (!is.character(question) || length(question) != 1L) {
+    stop("question must be a single character string")
+  }
+
+  # Retrieve relevant context
+  context_df <- edge_search(index, ctx, question, top_k = top_k)
+
+  # Build context string
+  context_texts <- context_df$chunk
+  context_block <- paste(
+    vapply(seq_along(context_texts), function(i) {
+      paste0("[", i, "] ", context_texts[i])
+    }, character(1)),
+    collapse = "\n\n"
+  )
+
+  # Build prompt
+  if (is.null(system_prompt)) {
+    system_prompt <- paste0(
+      "Answer the question based only on the provided context. ",
+      "If the context does not contain enough information, say so. ",
+      "Be concise and factual."
+    )
+  }
+
+  prompt <- paste0(
+    "### System\n", system_prompt,
+    "\n\n### Context\n", context_block,
+    "\n\n### Question\n", question,
+    "\n\n### Answer\n"
+  )
+
+  # Generate answer
+  raw <- edge_completion_internal(ctx, prompt,
+                                   as.integer(n_predict),
+                                   as.numeric(temperature),
+                                   0.95)
+
+  # Strip prompt
+  answer <- if (startsWith(raw, prompt)) {
+    substring(raw, nchar(prompt) + 1L)
+  } else {
+    raw
+  }
+  answer <- trimws(answer)
+
+  if (return_context) {
+    list(answer = answer, context = context_df, prompt = prompt)
+  } else {
+    answer
+  }
+}
+
+#' Print method for edge_index objects
+#'
+#' @param x An edge_index object
+#' @param ... Additional arguments (ignored)
+#' @return The object (invisibly)
+#' @export
+print.edge_index <- function(x, ...) {
+  cat(sprintf("edgemodelr RAG Index\n"))
+  cat(sprintf("  Chunks: %d\n", x$n_chunks))
+  cat(sprintf("  Embedding dim: %d\n", x$n_embd))
+
+  unique_sources <- unique(x$sources[!is.na(x$sources)])
+  if (length(unique_sources) > 0L) {
+    cat(sprintf("  Source files: %d\n", length(unique_sources)))
+    show_n <- min(5L, length(unique_sources))
+    for (s in unique_sources[seq_len(show_n)]) {
+      cat(sprintf("    - %s\n", basename(s)))
+    }
+    if (length(unique_sources) > show_n) {
+      cat(sprintf("    ... and %d more\n", length(unique_sources) - show_n))
+    }
+  } else {
+    cat("  Source: direct text input\n")
+  }
+
+  invisible(x)
+}
+
+
+# Internal helper: split text into overlapping chunks
+.chunk_text <- function(text, chunk_size = 500L, overlap = 50L) {
+  if (nchar(text) <= chunk_size) return(text)
+
+  chunks <- character()
+  pos <- 1L
+  text_len <- nchar(text)
+
+  while (pos <= text_len) {
+    end <- min(pos + chunk_size - 1L, text_len)
+
+    # Try to break at sentence boundary
+    if (end < text_len) {
+      chunk <- substr(text, pos, end)
+      # Look for last sentence-ending punctuation
+      breaks <- gregexpr("[.!?]\\s", chunk)[[1]]
+      if (breaks[1] > 0 && max(breaks) > chunk_size * 0.5) {
+        end <- pos + max(breaks)
+      }
+    }
+
+    chunks <- c(chunks, trimws(substr(text, pos, end)))
+    pos <- end + 1L - overlap
+  }
+
+  chunks[nchar(chunks) > 0L]
+}
+
+
+# ============================================================================
+# Plumber API Wrapper (Model-as-a-Service)
+# ============================================================================
+
+#' Serve a model as a local OpenAI-compatible API
+#'
+#' Starts a local Plumber API server that exposes the loaded model through
+#' endpoints compatible with the OpenAI API format. This allows other
+#' applications (Python, JavaScript, curl) to use the model over HTTP.
+#'
+#' @param model_path Path to a .gguf model file
+#' @param host Host to bind to (default: "127.0.0.1" for local only)
+#' @param port Port number (default: 8080)
+#' @param n_ctx Context size (default: 2048)
+#' @param n_gpu_layers GPU layers (default: 0, use -1 for full GPU offload)
+#' @param embeddings Enable embeddings endpoint (default: FALSE)
+#' @param api_key Optional API key for authentication. If set, requests must
+#'   include \code{Authorization: Bearer <key>} header.
+#'
+#' @details
+#' Endpoints served:
+#' \itemize{
+#'   \item \code{POST /v1/completions} — Text completion
+#'   \item \code{POST /v1/chat/completions} — Chat completion (uses model's native template)
+#'   \item \code{POST /v1/embeddings} — Text embeddings (if \code{embeddings = TRUE})
+#'   \item \code{GET /v1/models} — List loaded model info
+#'   \item \code{GET /health} — Health check
+#' }
+#'
+#' The server runs in the foreground. Press Ctrl+C / Esc to stop.
+#'
+#' @examples
+#' \dontrun{
+#' # Serve a model locally
+#' edge_serve("model.gguf", port = 8080)
+#'
+#' # Then from another terminal or Python:
+#' # curl http://localhost:8080/v1/chat/completions \
+#' #   -H "Content-Type: application/json" \
+#' #   -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+#' }
+#' @export
+edge_serve <- function(model_path, host = "127.0.0.1", port = 8080L,
+                        n_ctx = 2048L, n_gpu_layers = 0L, embeddings = FALSE,
+                        api_key = NULL) {
+
+  if (!requireNamespace("plumber", quietly = TRUE)) {
+    stop("The 'plumber' package is required for edge_serve().\n",
+         "Install it with: install.packages('plumber')")
+  }
+
+  if (!file.exists(model_path)) {
+    stop("Model file not found: ", model_path)
+  }
+
+  message("Loading model: ", basename(model_path))
+  ctx <- edge_load_model(model_path, n_ctx = n_ctx,
+                          n_gpu_layers = n_gpu_layers,
+                          embeddings = embeddings)
+
+  model_name <- tools::file_path_sans_ext(basename(model_path))
+  n_embd <- if (embeddings) edge_model_n_embd(ctx) else 0L
+
+  # Build plumber API programmatically
+  pr <- plumber::pr()
+
+  # Auth filter
+  if (!is.null(api_key) && nchar(api_key) > 0) {
+    pr <- plumber::pr_filter(pr, "auth", function(req, res) {
+      auth <- req$HTTP_AUTHORIZATION
+      if (is.null(auth) || auth != paste("Bearer", api_key)) {
+        res$status <- 401L
+        return(list(error = list(message = "Invalid API key", type = "authentication_error")))
+      }
+      plumber::forward()
+    })
+  }
+
+  # CORS filter
+  pr <- plumber::pr_filter(pr, "cors", function(req, res) {
+    res$setHeader("Access-Control-Allow-Origin", "*")
+    res$setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    res$setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    if (req$REQUEST_METHOD == "OPTIONS") {
+      res$status <- 200L
+      return(list())
+    }
+    plumber::forward()
+  })
+
+  # GET /health
+  pr <- plumber::pr_get(pr, "/health", function() {
+    list(status = "ok", model = model_name)
+  })
+
+  # GET /v1/models
+  pr <- plumber::pr_get(pr, "/v1/models", function() {
+    list(object = "list", data = list(
+      list(id = model_name, object = "model", owned_by = "local")
+    ))
+  })
+
+  # POST /v1/completions
+  pr <- plumber::pr_post(pr, "/v1/completions", function(req, res) {
+    body <- req$body
+    prompt <- body$prompt %||% ""
+    max_tokens <- body$max_tokens %||% 128L
+    temperature <- body$temperature %||% 0.7
+    top_p <- body$top_p %||% 0.95
+
+    tryCatch({
+      text <- edge_completion_internal(ctx, prompt,
+                                        as.integer(max_tokens),
+                                        as.numeric(temperature),
+                                        as.numeric(top_p))
+      list(
+        id = paste0("cmpl-", format(Sys.time(), "%Y%m%d%H%M%S")),
+        object = "text_completion",
+        model = model_name,
+        choices = list(list(text = text, index = 0L, finish_reason = "stop")),
+        usage = list(prompt_tokens = nchar(prompt) %/% 4L,
+                      completion_tokens = nchar(text) %/% 4L)
+      )
+    }, error = function(e) {
+      res$status <- 500L
+      list(error = list(message = e$message, type = "server_error"))
+    })
+  })
+
+  # POST /v1/chat/completions
+  pr <- plumber::pr_post(pr, "/v1/chat/completions", function(req, res) {
+    body <- req$body
+    messages <- body$messages
+    max_tokens <- body$max_tokens %||% 256L
+    temperature <- body$temperature %||% 0.7
+    top_p <- body$top_p %||% 0.95
+
+    if (is.null(messages) || length(messages) == 0) {
+      res$status <- 400L
+      return(list(error = list(message = "messages is required", type = "invalid_request")))
+    }
+
+    tryCatch({
+      text <- edge_chat_completion(ctx, messages,
+                                    n_predict = as.integer(max_tokens),
+                                    temperature = as.numeric(temperature),
+                                    top_p = as.numeric(top_p))
+      list(
+        id = paste0("chatcmpl-", format(Sys.time(), "%Y%m%d%H%M%S")),
+        object = "chat.completion",
+        model = model_name,
+        choices = list(list(
+          index = 0L,
+          message = list(role = "assistant", content = text),
+          finish_reason = "stop"
+        )),
+        usage = list(prompt_tokens = NA_integer_,
+                      completion_tokens = nchar(text) %/% 4L)
+      )
+    }, error = function(e) {
+      res$status <- 500L
+      list(error = list(message = e$message, type = "server_error"))
+    })
+  })
+
+  # POST /v1/embeddings (only if enabled)
+  if (embeddings) {
+    pr <- plumber::pr_post(pr, "/v1/embeddings", function(req, res) {
+      body <- req$body
+      input <- body$input
+      if (is.null(input)) {
+        res$status <- 400L
+        return(list(error = list(message = "input is required", type = "invalid_request")))
+      }
+      if (is.character(input) && length(input) == 1L) input <- list(input)
+
+      tryCatch({
+        texts <- as.character(unlist(input))
+        emb_matrix <- edge_embeddings(ctx, texts)
+
+        data_list <- lapply(seq_len(nrow(emb_matrix)), function(i) {
+          list(object = "embedding", embedding = as.numeric(emb_matrix[i, ]),
+               index = i - 1L)
+        })
+
+        list(
+          object = "list",
+          data = data_list,
+          model = model_name,
+          usage = list(prompt_tokens = sum(nchar(texts)) %/% 4L)
+        )
+      }, error = function(e) {
+        res$status <- 500L
+        list(error = list(message = e$message, type = "server_error"))
+      })
+    })
+  }
+
+  # Set serializer to JSON (unboxed for OpenAI compatibility)
+  pr <- plumber::pr_set_serializer(pr, plumber::serializer_unboxed_json())
+
+  message("\nedgemodelr API server starting")
+  message("  Model: ", model_name)
+  message("  Endpoints:")
+  message("    POST ", host, ":", port, "/v1/completions")
+  message("    POST ", host, ":", port, "/v1/chat/completions")
+  if (embeddings) message("    POST ", host, ":", port, "/v1/embeddings")
+  message("    GET  ", host, ":", port, "/v1/models")
+  message("    GET  ", host, ":", port, "/health")
+  if (!is.null(api_key)) message("  Auth: API key required")
+  message("\nPress Ctrl+C to stop.\n")
+
+  # Clean up model on exit
+  on.exit({
+    tryCatch(edge_free_model(ctx), error = function(e) NULL)
+    message("Model freed.")
+  })
+
+  plumber::pr_run(pr, host = host, port = as.integer(port))
+}
+
+# Null coalescing operator for plumber body parsing
+`%||%` <- function(x, y) if (is.null(x)) y else x
