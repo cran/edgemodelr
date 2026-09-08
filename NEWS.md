@@ -1,3 +1,72 @@
+# edgemodelr 0.4.3
+
+## CRAN Feedback Fixes
+
+* **Missing `<cstdlib>` in four more translation units**: `llama-mmap.cpp`
+  (`posix_memalign`, `free`), `llama-model-loader.cpp` (`getenv`, `atoi`),
+  `llama-vocab.cpp` (`strtol`) and `llama-batch.cpp` (`getenv`, `atoi`,
+  `malloc`, `free`) used C library functions without including the header
+  that declares them. Recent libc++ releases no longer supply these
+  through transitive includes, so clang 23 and fedora-clang rejected them.
+  `llama-batch.cpp` was not in the compiler report, because the build
+  stopped before reaching it; it was found by auditing every file in
+  `src/` for this defect rather than by patching the reported lines.
+
+* **38 further missing standard includes across 26 files**: the first audit
+  covered only the C headers (`<cstdlib>`, `<cstring>` and so on), but the
+  libc++ change behind the clang 23 failures removes transitive includes of
+  C++ headers too. A second audit covering the C++ standard library found
+  `std::min`, `std::copy`, `std::advance`, `std::distance`, `std::unique_ptr`,
+  `std::is_same`, `std::out_of_range`, `std::array`, `std::pair`, `std::move`
+  and `isspace`/`toupper` used in files that never included `<algorithm>`,
+  `<iterator>`, `<memory>`, `<type_traits>`, `<stdexcept>`, `<array>`,
+  `<utility>` or `<cctype>`. These build under libstdc++, which supplies the
+  declarations transitively, and would have failed under libc++.
+
+* **False `-Warray-bounds` in `llama-grammar.cpp`**: with optimisation and
+  `-Wall` now applied to the vendored sources, GCC 12 and later reported a
+  false positive against a zero-length array when
+  `llama_grammar_advance_stack()` copied a vector it had already proven
+  empty. R CMD check treats that warning as significant. The branch now
+  default-constructs the empty stack instead of copying it, which is
+  equivalent and does not trip the warning.
+
+* **`CFLAGS` and `CXXFLAGS` now reach the whole package**: the pattern
+  rules for `ggml/` and `llama/` passed only package-local flags to the
+  compiler, so flags set by the user or the site `Makevars` were applied
+  to 6 of 161 source files and silently dropped for the other 155.
+  Every rule in `src/Makevars` and `src/Makevars.win` now appends its
+  engine-specific additions to `$(ALL_CFLAGS)` or `$(ALL_CXXFLAGS)`
+  instead of replacing them. The variables were renamed to
+  `GGML_EXTRA_*` and `GENERIC_EXTRA_*` to make that contract explicit.
+
+# edgemodelr 0.4.2
+
+## Compiler Portability Fixes
+
+* **Installation failure on macOS x86_64** (CRAN r-release-macos-x86_64):
+  `path_str()` in `ggml/ggml-backend-reg.cpp` chose between two
+  conversion branches using `#if defined(__cpp_lib_char8_t)`. The libc++
+  shipped in MacOSX11.sdk defines that macro under `-std=gnu++20` but
+  its `std::filesystem::path::u8string()` still returns `std::string`,
+  so the branch guarded for `std::u8string` failed to compile. The
+  function now deduces the return type with `auto` and converts
+  byte-wise, which is correct whether the element type is `char` or
+  `char8_t`.
+
+* **C++ standard pinned to C++17** (`CXX_STD = CXX17` in `src/Makevars` and
+  `src/Makevars.win`): the bundled llama.cpp and GGML sources target C++17.
+  Without a pin, each platform applied its own default, so the same source
+  compiled as C++17 under R 4.5 and as C++20 under R 4.6 on macOS. Every
+  CRAN flavour now builds the dialect the vendored engine is written for.
+
+* **Installation failure on clang 23**: three translation units used
+  symbols they never included a header for, relying on transitive
+  includes that newer libc++ releases no longer provide.
+  `ggml/gguf.cpp` calls `errno` without `<cerrno>`, and
+  `llama/llama-graph.h` and `llama/llama-context.cpp` call `getenv()`
+  and `atoi()` without `<cstdlib>`. Each file now includes what it uses.
+
 # edgemodelr 0.4.1
 
 ## CRAN Resubmission Fixes

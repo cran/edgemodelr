@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <forward_list>
 #include <limits>
@@ -20,6 +21,7 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <iterator>
 
 //
 // helpers
