@@ -13,6 +13,7 @@
 #include <map>
 #include <random>
 #include <vector>
+#include <cstring>
 
 /* CRAN compliance: suppress stdio diagnostic output in R builds.
  * The fprintf/fflush calls in this file render a training-progress
@@ -611,6 +612,7 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
+    ggml_free(opt_ctx->ctx_copy);
     delete opt_ctx;
 }
 

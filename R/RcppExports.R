@@ -13,12 +13,12 @@ edge_cuda_backend_loaded_internal <- function() {
     .Call(`_edgemodelr_edge_cuda_backend_loaded_internal`)
 }
 
-edge_load_model_internal <- function(model_path, n_ctx = 2048L, n_gpu_layers = 0L, n_threads = 0L, flash_attn = TRUE, embeddings = FALSE) {
-    .Call(`_edgemodelr_edge_load_model_internal`, model_path, n_ctx, n_gpu_layers, n_threads, flash_attn, embeddings)
+edge_load_model_internal <- function(model_path, n_ctx, n_gpu_layers, n_threads, flash_attn, embeddings, prompt_cache, lora_paths, lora_scales, n_parallel, cache_type_k = "f16", cache_type_v = "f16") {
+    .Call(`_edgemodelr_edge_load_model_internal`, model_path, n_ctx, n_gpu_layers, n_threads, flash_attn, embeddings, prompt_cache, lora_paths, lora_scales, n_parallel, cache_type_k, cache_type_v)
 }
 
-edge_completion_internal <- function(model_ptr, prompt, n_predict = 128L, temperature = 0.8, top_p = 0.95, timeout_seconds = 0.0) {
-    .Call(`_edgemodelr_edge_completion_internal`, model_ptr, prompt, n_predict, temperature, top_p, timeout_seconds)
+edge_completion_internal <- function(model_ptr, prompt, n_predict, sampling, timeout_seconds = 0.0) {
+    .Call(`_edgemodelr_edge_completion_internal`, model_ptr, prompt, n_predict, sampling, timeout_seconds)
 }
 
 edge_free_model_internal <- function(model_ptr) {
@@ -29,20 +29,80 @@ is_valid_model_internal <- function(model_ptr) {
     .Call(`_edgemodelr_is_valid_model_internal`, model_ptr)
 }
 
-edge_completion_stream_internal <- function(model_ptr, prompt, callback, n_predict = 128L, temperature = 0.8, top_p = 0.95) {
-    .Call(`_edgemodelr_edge_completion_stream_internal`, model_ptr, prompt, callback, n_predict, temperature, top_p)
+edge_completion_stream_internal <- function(model_ptr, prompt, callback, n_predict, sampling) {
+    .Call(`_edgemodelr_edge_completion_stream_internal`, model_ptr, prompt, callback, n_predict, sampling)
 }
 
-edge_completion_grammar_internal <- function(model_ptr, prompt, grammar_str, grammar_root, n_predict = 512L, temperature = 0.3, top_p = 0.95) {
-    .Call(`_edgemodelr_edge_completion_grammar_internal`, model_ptr, prompt, grammar_str, grammar_root, n_predict, temperature, top_p)
+edge_completion_grammar_internal <- function(model_ptr, prompt, grammar_str, grammar_root, n_predict, sampling, jump_forward = TRUE) {
+    .Call(`_edgemodelr_edge_completion_grammar_internal`, model_ptr, prompt, grammar_str, grammar_root, n_predict, sampling, jump_forward)
+}
+
+edge_completion_batch_internal <- function(model_ptr, prompts, n_predict, sampling, seeds, grammar_str, grammar_root) {
+    .Call(`_edgemodelr_edge_completion_batch_internal`, model_ptr, prompts, n_predict, sampling, seeds, grammar_str, grammar_root)
+}
+
+edge_engine_start_internal <- function(model_ptr, n_slots, max_queue) {
+    .Call(`_edgemodelr_edge_engine_start_internal`, model_ptr, n_slots, max_queue)
+}
+
+edge_engine_stop_all_internal <- function() {
+    .Call(`_edgemodelr_edge_engine_stop_all_internal`)
+}
+
+edge_engine_submit_internal <- function(engine_ptr, prompt, n_predict, sampling, grammar_str = "", grammar_root = "root") {
+    .Call(`_edgemodelr_edge_engine_submit_internal`, engine_ptr, prompt, n_predict, sampling, grammar_str, grammar_root)
+}
+
+edge_engine_poll_internal <- function(engine_ptr, ids) {
+    .Call(`_edgemodelr_edge_engine_poll_internal`, engine_ptr, ids)
+}
+
+edge_engine_release_internal <- function(engine_ptr, ids) {
+    invisible(.Call(`_edgemodelr_edge_engine_release_internal`, engine_ptr, ids))
+}
+
+edge_engine_cancel_internal <- function(engine_ptr, ids) {
+    invisible(.Call(`_edgemodelr_edge_engine_cancel_internal`, engine_ptr, ids))
+}
+
+edge_engine_stats_internal <- function(engine_ptr) {
+    .Call(`_edgemodelr_edge_engine_stats_internal`, engine_ptr)
+}
+
+edge_engine_stop_internal <- function(engine_ptr) {
+    invisible(.Call(`_edgemodelr_edge_engine_stop_internal`, engine_ptr))
+}
+
+edge_save_state_internal <- function(model_ptr, path) {
+    .Call(`_edgemodelr_edge_save_state_internal`, model_ptr, path)
+}
+
+edge_load_state_internal <- function(model_ptr, path) {
+    .Call(`_edgemodelr_edge_load_state_internal`, model_ptr, path)
 }
 
 edge_embeddings_internal <- function(model_ptr, texts, normalize = TRUE) {
     .Call(`_edgemodelr_edge_embeddings_internal`, model_ptr, texts, normalize)
 }
 
+edge_lora_scales_internal <- function(model_ptr, scales = NULL) {
+    .Call(`_edgemodelr_edge_lora_scales_internal`, model_ptr, scales)
+}
+
+edge_set_threads_internal <- function(model_ptr, n_threads, n_threads_batch) {
+    invisible(.Call(`_edgemodelr_edge_set_threads_internal`, model_ptr, n_threads, n_threads_batch))
+}
+
+edge_n_parallel_internal <- function(model_ptr) {
+    .Call(`_edgemodelr_edge_n_parallel_internal`, model_ptr)
+}
+
 edge_model_n_embd_internal <- function(model_ptr) {
     .Call(`_edgemodelr_edge_model_n_embd_internal`, model_ptr)
+}
+
+edge_tokenize_internal <- function(model_ptr, text, add_special = TRUE) {
+    .Call(`_edgemodelr_edge_tokenize_internal`, model_ptr, text, add_special)
 }
 
 edge_chat_apply_template_internal <- function(model_ptr, messages, add_generation_prompt = TRUE) {

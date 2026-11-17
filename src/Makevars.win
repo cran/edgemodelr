@@ -22,17 +22,19 @@ GGML_EXTRA_CXXFLAGS = -ftree-vectorize
 GGML_EXTRA_CFLAGS = -ftree-vectorize -fno-builtin-printf -fexceptions
 PKG_LIBS = $(LAPACK_LIBS) $(BLAS_LIBS) $(FLIBS)
 
-# Model-specific objects (one file per model architecture, added in b8179)
+# Model-specific objects (one file per model architecture)
 MODEL_OBJECTS = $(patsubst llama/models/%.cpp,llama/models/%.o,$(wildcard llama/models/*.cpp))
 
 # Core object files (common to all architectures)
 CORE_OBJECTS = bindings.o RcppExports.o \
 	ggml/ggml.o ggml/ggml-alloc.o ggml/gguf.o \
-	ggml/ggml-backend.o ggml/ggml-backend-reg.o ggml/ggml-backend-dl.o \
+	ggml/ggml-backend.o ggml/ggml-backend-reg.o ggml/ggml-backend-dl.o ggml/ggml-backend-meta.o \
 	ggml/ggml-quants.o ggml/ggml-threading.o ggml/ggml-opt.o \
 	llama/llama-adapter.o llama/llama-arch.o llama/llama-batch.o llama/llama-chat.o \
 	llama/llama-context.o llama/llama-cparams.o llama/llama-grammar.o llama/llama-graph.o \
 	llama/llama-hparams.o llama/llama-impl.o llama/llama-io.o llama/llama-kv-cache-iswa.o \
+	llama/llama-kv-cache-dsa.o llama/llama-kv-cache-dsa-iswa.o llama/llama-kv-cache-dsv4.o \
+	llama/llama-kv-cache-msa.o llama/llama-memory-hybrid-idx.o llama/llama-moe-cache.o \
 	llama/llama-kv-cache.o llama/llama-memory-hybrid.o llama/llama-memory-hybrid-iswa.o \
 	llama/llama-memory-recurrent.o \
 	llama/llama-memory.o llama/llama-mmap.o llama/llama-model-loader.o llama/llama-model-saver.o llama/llama-model.o \
@@ -41,6 +43,7 @@ CORE_OBJECTS = bindings.o RcppExports.o \
 	ggml/ggml-cpu/ggml-cpu-c.o ggml/ggml-cpu/ggml-cpu-cpp.o ggml/ggml-cpu/ops.o \
 	ggml/ggml-cpu/binary-ops.o ggml/ggml-cpu/unary-ops.o ggml/ggml-cpu/vec.o \
 	ggml/ggml-cpu/traits.o ggml/ggml-cpu/repack.o ggml/ggml-cpu/quants.o \
+	ggml/ggml-cpu/tiled/tiled.o ggml/ggml-cpu/tiled/tiled-kernel.o \
 	simd_info.o
 
 # ============================================================================
@@ -85,10 +88,29 @@ else
   GGML_EXTRA_CXXFLAGS += -DGGML_CPU_GENERIC
   GGML_EXTRA_CFLAGS += -DGGML_CPU_GENERIC
   ARCH_OBJECTS =
+  # On x86-64 the generic build also carries the AVX2 kernels, built with a
+  # target pragma in edgemodelr-avx2.c rather than a compiler flag, and
+  # switches to them at run time on CPUs that have AVX2.
+  DISPATCH_OBJECTS = ggml/ggml-cpu/edgemodelr-avx2.o
+  GGML_EXTRA_CFLAGS += -DEDGEMODELR_CPU_DISPATCH
+  # Unlike the SIMD builds, this needs no -Wa,-muse-unaligned-vector-move:
+  # the AVX2 kernels never spill a 32-byte register to the stack, the case
+  # Windows GCC gets wrong (checked with objdump, GCC 14), and R CMD check
+  # flags that option as non-portable.
+endif
+
+# 64-bit Windows GCC cannot keep the stack 32-byte aligned for AVX, so an
+# aligned vector move on a spilled register faults: every SIMD build used to
+# segfault in edge_load_model(). Have the assembler emit unaligned moves
+# instead, which cost nothing on current CPUs. SIMD builds only; the default
+# generic build is unchanged.
+ifneq ($(strip $(ARCH_OBJECTS)),)
+  GGML_EXTRA_CXXFLAGS += -Wa,-muse-unaligned-vector-move
+  GGML_EXTRA_CFLAGS += -Wa,-muse-unaligned-vector-move
 endif
 
 # Complete objects list with architecture support and model implementations
-OBJECTS = $(CORE_OBJECTS) $(MODEL_OBJECTS) $(ARCH_OBJECTS)
+OBJECTS = $(CORE_OBJECTS) $(MODEL_OBJECTS) $(ARCH_OBJECTS) $(DISPATCH_OBJECTS)
 
 all: $(SHLIB)
 
@@ -127,6 +149,11 @@ else
 GENERIC_EXTRA_CFLAGS   = -ftree-vectorize -fexceptions
 GENERIC_EXTRA_CXXFLAGS = -ftree-vectorize
 endif
+
+# The AVX2 kernels of the generic build: compiled without GGML_CPU_GENERIC so
+# that arch/x86/quants.c takes its AVX2 paths (see edgemodelr-avx2.c).
+ggml/ggml-cpu/edgemodelr-avx2.o: ggml/ggml-cpu/edgemodelr-avx2.c
+	$(CC) $(ALL_CPPFLAGS) $(ALL_CFLAGS) $(filter-out -DGGML_CPU_GENERIC,$(GGML_EXTRA_CFLAGS)) -c $< -o $@
 
 ggml/ggml-cpu/quants.o: ggml/ggml-cpu/quants.c
 	$(CC) $(ALL_CPPFLAGS) $(ALL_CFLAGS) $(GENERIC_EXTRA_CFLAGS) -c $< -o $@

@@ -4,10 +4,10 @@
 \alias{edge_install_cuda_toolkit}
 \title{Install CUDA runtime libraries required for GPU inference}
 \usage{
-edge_install_cuda_toolkit(cuda_version = "13.1", force = FALSE)
+edge_install_cuda_toolkit(cuda_version = "13.4", force = FALSE)
 }
 \arguments{
-\item{cuda_version}{CUDA major version string, e.g. \code{"13.1"} (default).
+\item{cuda_version}{CUDA major version string, e.g. \code{"13.4"} (default).
 Must match the version used with \code{\link{edge_install_cuda}()}.}
 
 \item{force}{Reinstall even if the runtime DLLs are already present.}
@@ -19,10 +19,10 @@ Invisibly returns the cuda cache directory path.
 The CUDA backend (\code{ggml-cuda-XX.dll}) requires two sets of runtime DLLs
 that are \strong{not} included with the NVIDIA display driver:
 \itemize{
-  \item \strong{nvcudart_hybrid64.dll} — CUDA hybrid runtime, already
+  \item \strong{nvcudart_hybrid64.dll}: CUDA hybrid runtime, already
         present on your system in the Windows DriverStore (installed with
         the GPU driver). This function copies it to the edgemodelr cache.
-  \item \strong{cublas64_13.dll / cublasLt64_13.dll} — cuBLAS linear-algebra
+  \item \strong{cublas64_13.dll / cublasLt64_13.dll}: cuBLAS linear-algebra
         library (~400 MB download from NVIDIA's official redistrib server).
 }
 

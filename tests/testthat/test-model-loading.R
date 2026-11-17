@@ -70,3 +70,28 @@ test_that("is_valid_model handles invalid contexts", {
   result <- is_valid_model()
   expect_false(result)
 })
+
+test_that("edge_load_model checks LoRA arguments before loading", {
+  fake <- tempfile(fileext = ".gguf")
+  writeBin(charToRaw("GGUF"), fake)
+  on.exit(unlink(fake), add = TRUE)
+  expect_error(edge_load_model(fake, lora = "no-such-adapter.gguf"),
+               "LoRA adapter file does not exist")
+  expect_error(edge_load_model(fake, lora = 1), "character vector")
+  expect_error(edge_load_model(fake, lora = fake, lora_scale = "a"), "numeric")
+})
+
+test_that("edge_lora_scale rejects invalid contexts", {
+  expect_error(edge_lora_scale(NULL), "Invalid model context")
+})
+
+test_that("n_parallel and the state functions check their arguments", {
+  f <- tempfile(fileext = ".gguf")
+  writeBin(charToRaw("GGUF"), f)
+  on.exit(unlink(f))
+  expect_error(edge_load_model(f, n_parallel = 0), "n_parallel")
+  expect_error(edge_load_model(f, n_parallel = 2.5), "n_parallel")
+  expect_error(edge_load_model(f, n_parallel = 100), "n_parallel")
+  expect_error(edge_save_state(NULL, "x.kv"), "Invalid model context")
+  expect_error(edge_load_state(NULL, "x.kv"), "Invalid model context")
+})

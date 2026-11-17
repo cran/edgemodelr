@@ -1,3 +1,253 @@
+# edgemodelr 0.7.0
+
+0.5.0 and 0.6.0 were not released on CRAN, so their changes (in their own
+sections below) also reach CRAN with this release.
+
+## New features
+
+* `edge_api()` serves a model to many users at once, for Posit Connect or
+  any server that runs plumber APIs. A new serving engine, `edge_engine()`,
+  runs requests in a background thread with continuous batching: up to
+  `n_slots` requests are generated together and the rest wait in a queue,
+  so a busy server answers later instead of failing. Request handlers
+  return promises, so R keeps accepting requests while the model works. A
+  finished request leaves its tokens in its slot, and a request that starts
+  the same way (the same system prompt, or the next turn of a chat) skips
+  that part of its prompt; `usage$prompt_tokens_details$cached_tokens`
+  reports it. On an 8 core laptop, 8 slots gave about 3 to 4 times the total
+  tokens per second of one. New `POST /v1/jobs` endpoints return at once
+  and report the queue position and the text so far, which suits Shiny
+  apps, and `GET /metrics` reports the engine's counters. A full queue
+  answers 503 with `Retry-After`. `inst/examples/posit-connect` has an API
+  entrypoint and a Shiny chat app that uses it.
+
+* Chat and text completions from `edge_api()` and `edge_serve()` include a
+  `timings` object, as llama.cpp's server does: milliseconds spent waiting
+  in the queue, reading the prompt and generating, the prompt tokens reused
+  from a slot, and tokens per second.
+
+* `edge_serve()` runs on `edge_api()`, with one slot by default and an
+  `n_slots` argument. It now also accepts the key as `X-API-Key`, since
+  Posit Connect uses `Authorization` for its own keys.
+
+* The default thread count follows a container's CPU limit (cgroup v1 and
+  v2) instead of the host's core count, and batches no longer use every
+  hardware thread in a container. Too many threads made llama.cpp several
+  times slower on a shared or limited CPU.
+
+* `edge_completion()`, `edge_stream_completion()`, `edge_chat_completion()`,
+  `edge_chat_stream()`, `edge_grammar_completion()` and `edge_map()` have new
+  sampling arguments: `top_k`, `min_p`, `repeat_penalty`, `seed` and `stop`.
+  `repeat_penalty = 1.2` keeps small models from repeating themselves, and
+  `stop` ends the text at the first of the given strings. `edge_serve()`
+  passes on `seed` and `stop` from requests.
+
+* Tool calling (#35). Describe tools with the new `edge_tool()` and pass
+  them to `edge_chat_completion(tools = ...)`. A grammar makes the model
+  either call one of the tools, with every argument present and of the
+  declared type, or say no tool is needed, in which case it answers in text.
+  `tool_choice` can require a call, or a call to one tool. The call is
+  chosen greedily, and a repeat of the last call whose result is already in
+  the conversation becomes a text answer.
+
+* `edge_load_model()` has a new `n_parallel` argument. With it,
+  `edge_map()` and `edge_extract_batch()` generate for several texts at
+  once, one token for each in every decode step.
+
+* `edge_save_state()` and `edge_load_state()` save the prompt cache to a
+  file and load it back, so a long system prompt or document is processed
+  once instead of in every session.
+
+* `edge_serve()` is closer to the OpenAI API. `usage` counts tokens with
+  the model's tokenizer, `finish_reason` is "length" when `max_tokens` ran
+  out, `stream = true` sends OpenAI chunks as server-sent events (all at the
+  end of generation, since plumber cannot send a response in parts), and
+  chat requests take `tools`, `tool_choice` and `response_format` with a
+  JSON schema. Tool calls come back in `message$tool_calls`. The official
+  OpenAI Python client works with it.
+
+* New `chat_edge()` returns an ellmer chat backed by a local GGUF model,
+  served by `edge_serve()` in a background R process. Chat, streaming,
+  tool calling and `chat_structured()` work.
+
+* New `edge_tokenize()` returns a text's tokens with the model's tokenizer.
+
+* New `embed_edge()` embeds texts with a local model and, called without
+  texts, returns a function for `ragnar::ragnar_store_create(embed = )`.
+  The function refers to the model by path, so a saved store works again
+  in a new session. `chat_edge(embeddings = TRUE)` also serves
+  `/v1/embeddings` from its background server.
+
+* `edge_load_model()` gains `cache_type_k` and `cache_type_v` to store the
+  KV cache in a smaller format. `"q8_0"` for both halves the cache's memory
+  with almost no change in output. A quantized `cache_type_v` needs
+  `flash_attn = TRUE`, which is the default.
+
+## Changes
+
+* `edge_embeddings()` no longer reads past the end of a model's output:
+  vectors now have the model's output width, which differs from its hidden
+  size for some embedding models such as EmbeddingGemma2, and a reranker
+  model gives an error instead.
+
+* `edge_stream_completion()` no longer splits a character across two
+  callback calls when it spans several tokens, as emojis often do, so every
+  streamed piece is valid UTF-8.
+
+* `edge_tool()` and `edge_json_grammar()` take `I("x")` for a field with a
+  single allowed value, which would otherwise read as a type name.
+
+* The default build is faster on x86-64 CPUs with AVX2: it now also carries
+  the AVX2 versions of the quantized dot-product kernels and switches to
+  them at run time, so no `EDGEMODELR_SIMD` reinstall is needed. TinyLlama
+  generates about 2.7 times faster on a Windows laptop. CPUs without AVX2
+  keep the generic kernels, and `EDGEMODELR_KERNELS=generic` in the
+  environment keeps them too. `edge_simd_info()$kernels` reports which are
+  in use. For now this covers GCC builds (Linux and Windows); clang builds,
+  such as macOS on Intel, keep the generic kernels.
+
+* `edge_serve()` fixes: `/v1/chat/completions` no longer fails with
+  "history must be a list of turns", and responses no longer wrap single
+  values in arrays, so OpenAI clients can read them.
+
+* Sampled text (temperature above 0) is no longer the same on every call.
+  The seed used to be fixed; it is now drawn from R's random number
+  generator, so `set.seed()` makes results reproducible, or pass `seed`.
+  Greedy decoding (`temperature = 0`) is unchanged.
+
+# edgemodelr 0.6.0
+
+0.6.0 was not released on CRAN; its changes reach CRAN with 0.7.0.
+
+## New features
+
+* `edge_load_model()` has new `lora` and `lora_scale` arguments to apply
+  LoRA adapters in GGUF format on top of a base model (#38). The new
+  `edge_lora_scale()` reads or changes the adapter scales without reloading,
+  so one base model can switch between adapters from call to call; 0 turns
+  an adapter off. An adapter for a 0.6B model is about 20 MB, against
+  640 MB for a merged copy of the model.
+
+## llama.cpp
+
+* Updated the bundled llama.cpp from b8179 (GGML 0.9.7) to v0.8.0, build
+  b11960 (GGML 0.28.0). This adds model architectures released since
+  February 2026, including Gemma 4, LFM3 and newer Granite and DeepSeek
+  models. The CRAN patches (no stdio,
+  abort or exit in compiled code, no diagnostic pragmas) are carried over.
+  Newer models also run faster: Qwen3.5 2B took 13.4 s per grammar-constrained
+  answer instead of 20.3 s on the default build, 8 threads.
+
+* `edge_install_cuda()` now downloads the CUDA backend from build b11960 to
+  match, and both it and `edge_install_cuda_toolkit()` default to CUDA 13.4,
+  since that build ships 12.4 and 13.4.
+
+## Speed
+
+* On 64-bit ARM (Apple silicon, ARM Linux) the default build now uses
+  llama.cpp's NEON kernels instead of generic C. NEON is part of the aarch64
+  baseline, so no extra compiler flags are needed. x86 keeps the portable
+  generic build by default.
+
+* `edge_embeddings()` decodes several texts per batch, one sequence each,
+  instead of one text per decode. On 64 short texts such as codelist terms
+  this is about 1.4x faster on an 8 core CPU.
+
+* `edge_load_model()` now uses one thread per physical core when
+  `n_threads` is NULL, instead of every hardware thread. On an 8 core,
+  16 thread CPU this doubled generation speed (21 to 49 tokens per second
+  with a 0.6B model). Prompt processing still uses every hardware thread,
+  which is faster there.
+
+* `edge_grammar_completion()` has a new `jump_forward` argument, on by
+  default. Text the grammar allows in only one way (JSON keys, separators,
+  the rest of an enum value once it is unambiguous) is added without sampling
+  and decoded in one batch. With four long JSON keys a 0.6B model wrote the
+  object about 3x faster; with short keys the saving is small. The forced
+  text is tokenized the standard way, so output can differ slightly from
+  `jump_forward = FALSE`.
+
+* `edge_json_grammar()` has a new `compact` argument. With `compact = TRUE`
+  the layout is fixed to `{"key": value, "key": value}`, so every key and
+  separator is forced and jump-forward skips over it.
+
+# edgemodelr 0.5.0
+
+0.5.0 was not released on CRAN; its changes reach CRAN with 0.7.0.
+
+## New features
+
+* `edge_text_to_sql()` turns a natural language question plus a CREATE TABLE
+  schema into SQL. Pass a DBI connection to `con` and it executes the query
+  and returns the rows, otherwise it returns the statement.
+
+* `edge_narrate()` writes a short English summary of a record. Accepts a
+  named list, a single row, or a multi-row data frame, and returns one
+  narrative per record.
+
+* `edge_verify_narrative()` checks a generated narrative against the values
+  it came from. A deterministic check, which needs no model, confirms that
+  every numeric source value appears in the text. With `terms` (for example
+  the study's drug names and MedDRA terms) it also flags terms the narrative
+  adds that are not in the source, likely hallucinations, and source terms it
+  leaves out. A model-based check re-extracts the named fields and compares
+  them to the source, with a tolerance for numeric fields. Both run by
+  default; `method = "literal"` runs the deterministic check alone.
+
+* `edge_extract()` and `edge_extract_batch()` gain `draft = TRUE`, which lets
+  the model answer in free text before the grammar-constrained pass. Forcing
+  a very small model straight into strict JSON can cost accuracy; drafting
+  first usually recovers it, at two to four times the generation time.
+
+All three need a capable model. Small general purpose models produce valid
+SQL that answers a different question, and narratives that restate the input
+rather than summarise it. The reference pages say so.
+
+## Performance
+
+* `edge_load_model()` gains `prompt_cache`. With `prompt_cache = TRUE` the
+  model keeps its KV cache between calls and reuses the part of a new prompt
+  that matches the start of the previous one, so only the rest is processed.
+  It helps most when prompts share a long fixed beginning such as a system
+  prompt; in one test it cut each call by about 30%. Answers still depend
+  only on their own prompt. Off by default.
+
+* Grammar-constrained generation is about twice as fast on SIMD builds
+  (`edge_grammar_completion()` and everything built on it, such as
+  `edge_extract()` and `edge_classify()`). The grammar used to be checked
+  against every token in the vocabulary at every step; it now checks the
+  sampled token and falls back to the full check only when that token is
+  rejected, as llama.cpp does.
+
+## Bug fixes
+
+* **Missing standard library includes.** Twenty three C library headers were
+  used but not included, in files that only compiled because another header
+  happened to pull them in. Two headers shared between C and C++ used the
+  C++ spelling.
+
+* **SIMD builds no longer crash on Windows.** Installing with
+  `EDGEMODELR_SIMD` set to AVX, AVX2, AVX512 or NATIVE built fine but
+  segfaulted in `edge_load_model()`: 64-bit Windows GCC cannot keep the
+  stack 32-byte aligned for AVX, so aligned vector moves faulted. SIMD
+  builds on Windows now assemble with `-Wa,-muse-unaligned-vector-move`.
+  The default generic build is unchanged.
+
+* `temperature = 0` now means greedy decoding, so the same prompt always
+  gives the same text. It used to skip temperature scaling but still sample
+  at random.
+
+* `edge_json_grammar()` allows at most one newline and indentation between
+  fields. With unlimited whitespace a model could fill `n_predict` with
+  blank lines and return incomplete JSON, which greedy decoding did every
+  time.
+## Docker
+
+* Added `docker/` with a base image, a variant with TinyLlama baked in, and
+  a compose file. The base image declares the model cache as a volume so a
+  host cache can be mounted for offline use.
+
+
 # edgemodelr 0.4.5
 
 ## Bug fixes
